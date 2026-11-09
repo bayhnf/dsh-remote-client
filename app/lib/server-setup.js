@@ -9,6 +9,13 @@
  * systemd --user unit that runs `dsh --profile server` on 127.0.0.1.
  */
 
+/**
+ * Shell function `bundles FILE`: prints the profile's selected bundles (dsh.profile.bundles), one
+ * per line; exits 2 when the manifest is missing or malformed. Package dependencies are not
+ * composition, so a name in `dependencies` alone does not count.
+ */
+const BUNDLES_FN = `bundles() { node -e 'try { const b = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).dsh.profile.bundles; if (!Array.isArray(b)) process.exit(2); console.log(b.join("\\n")) } catch { process.exit(2) }' "$1" 2>/dev/null; }`
+
 /** Marker printed before the JSON report so login-shell noise cannot break parsing. */
 const REPORT = '@@DSH-REMOTE-REPORT@@'
 
@@ -36,7 +43,8 @@ export function probeScript({ serverUnit, serverLog }) {
     'node_v=$(v node --version); dsh_v=$(v dsh --version); tui=$(command -v dsh-tui >/dev/null && echo yes || echo no)',
     'unit=$(systemctl --user is-active "$U" 2>/dev/null || true); [ -n "$unit" ] || unit=unknown',
     'launch=$(grep -a -c "dsh web: http" -- "$L" 2>/dev/null); case "$launch" in ""|*[!0-9]*) launch=0;; esac',
-    `plugin=$(grep -q '"${PLUGIN}"' "$HOME/.dsh/profiles/server/package.json" 2>/dev/null && echo yes || echo no)`,
+    BUNDLES_FN,
+    `plugin=$(bundles "$HOME/.dsh/profiles/server/package.json" | grep -qx '${PLUGIN}' && echo yes || echo no)`,
     `printf '${REPORT}{"hostname":"%s","os":"%s","node":"%s","dsh":"%s","dshTui":"%s","unit":"%s","launchLines":%s,"plugin":"%s"}\\n' "$(hostname)" "$(uname -s)" "$node_v" "$dsh_v" "$tui" "$unit" "$launch" "$plugin"`,
   ].join('\n')
 }
@@ -85,19 +93,28 @@ export function setupScript({ serverUnit, serverLog, serverPort }, pluginTarball
     // `dsh plugin` runs pnpm in the profile directory; corepack ships with Node and provides it.
     'if ! command -v pnpm >/dev/null; then',
     '  say "enable pnpm"',
-    '  if command -v corepack >/dev/null && corepack enable --install-directory "$(dirname "$DSH")" pnpm 2>/dev/null && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 pnpm --version >/dev/null 2>&1; then :',
-    `  else npm install -g --prefix "$(npm config get prefix)" --no-fund --no-audit ${PINNED.pnpm} >/dev/null 2>&1 || npm install -g --prefix "$HOME/.npm-global" --no-fund --no-audit ${PINNED.pnpm} >/dev/null; fi`,
+    `  PNPM_VERSION=${PINNED.pnpm.slice('pnpm@'.length)}`,
+    '  if command -v corepack >/dev/null && corepack enable --install-directory "$(dirname "$DSH")" pnpm 2>/dev/null && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack prepare "pnpm@$PNPM_VERSION" --activate >/dev/null 2>&1 && [ "$(pnpm --version 2>/dev/null)" = "$PNPM_VERSION" ]; then :',
+    '  else',
+    '    for PP in "$(npm config get prefix)" "$HOME/.npm-global"; do',
+    `      npm install -g --prefix "$PP" --no-fund --no-audit ${PINNED.pnpm} >/dev/null 2>&1 || continue`,
+    '      export PATH="$PATH:$PP/bin"; break',
+    '    done',
+    '  fi',
+    '  command -v pnpm >/dev/null || { echo "pnpm could not be installed; install pnpm $PNPM_VERSION and retry" >&2; exit 16; }',
     'fi',
     'export COREPACK_ENABLE_DOWNLOAD_PROMPT=0',
     // The log holds the reusable launch token: keep it owner-only.
-    `L="${logPath(serverLog)}"; umask 077; mkdir -p "$(dirname "$L")"; chmod 700 "$(dirname "$L")"; touch "$L"; chmod 600 "$L"`,
-    'P="$HOME/.dsh/profiles/server/package.json"',
-    // A missing or half-created profile is initialized from the shipped Web template; an existing
-    // profile without the Web bundle belongs to the user and is not replaced.
-    'if [ ! -f "$P" ]; then say "create server profile"; "$DSH" --profile server --from-default-profile web --dump-config >/dev/null',
-    'elif ! grep -q \'"@deepseek-ai/dsh-web-app"\' "$P"; then echo "~/.dsh/profiles/server exists but does not include @deepseek-ai/dsh-web-app; add it or move the profile away, then retry" >&2; exit 15; fi',
+    `L="${logPath(serverLog)}"; umask 077; mkdir -p "$(dirname "$L")"; chmod 700 "$(dirname "$L")" 2>/dev/null || true; touch "$L"; chmod 600 "$L"`,
+    BUNDLES_FN,
+    'D="$HOME/.dsh/profiles/server"; P="$D/package.json"',
+    // Only a missing or empty profile is created from the shipped Web template (which replaces the
+    // directory). Anything else belongs to the user and is never replaced.
+    'if [ ! -e "$D" ] || [ -z "$(ls -A "$D" 2>/dev/null)" ]; then say "create server profile"; "$DSH" --profile server --from-default-profile web --dump-config >/dev/null',
+    'elif ! bundles "$P" >/dev/null; then echo "$D exists but has no valid package.json; move it away (it is kept as is), then retry" >&2; exit 15',
+    'elif ! bundles "$P" | grep -qx "@deepseek-ai/dsh-web-app"; then echo "$D does not select @deepseek-ai/dsh-web-app in dsh.profile.bundles; add it or move the profile away, then retry" >&2; exit 15; fi',
     'changed=no',
-    `if ! grep -q '"${PLUGIN}"' "$HOME/.dsh/profiles/server/package.json"; then`,
+    `if ! bundles "$P" | grep -qx '${PLUGIN}'; then`,
     `  T="$HOME/.dsh/${PLUGIN}.tgz"; printf %s '${pluginTarball}' | base64 -d > "$T"`,
     `  say "add ${PLUGIN} to the server profile"; "$DSH" plugin --profile server add "$T" </dev/null >/dev/null 2>"$T.log" || { tail -n 20 "$T.log" >&2; exit 14; }; changed=yes`,
     'fi',
@@ -107,7 +124,8 @@ export function setupScript({ serverUnit, serverLog, serverPort }, pluginTarball
     '  {',
     '    printf "[Unit]\\nDescription=DeepSeek Harness server (dsh-remote-client)\\nAfter=network-online.target\\n[Service]\\nType=simple\\nWorkingDirectory=%%h\\n"',
     // The user manager has its own PATH; give the service the Node that setup found.
-    '    printf "Environment=PATH=%s:/usr/local/bin:/usr/bin:/bin\\n" "$(dirname "$(command -v node)")"',
+    '    SP="$(dirname "$(command -v node)")"; for c in dsh dsh-tui pnpm; do d=$(dirname "$(command -v $c 2>/dev/null || echo /usr/bin/x)"); case ":$SP:" in *":$d:"*) ;; *) SP="$SP:$d";; esac; done',
+    '    printf "Environment=PATH=%s:/usr/local/bin:/usr/bin:/bin\\n" "$SP"',
     `    printf "ExecStart=%s --profile server --host 127.0.0.1 --port ${serverPort} --no-open\\n" "$DSH"`,
     '    printf "UMask=0077\\nRestart=always\\nRestartSec=5\\nStandardOutput=append:%s\\nStandardError=append:%s\\n[Install]\\nWantedBy=default.target\\n" "$L" "$L"',
     '  } > "$UNIT"',

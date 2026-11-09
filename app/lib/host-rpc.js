@@ -12,7 +12,7 @@ const record = value => typeof value === 'object' && value !== null && !Array.is
  * @returns {Promise<string>} Cookie header value.
  */
 export async function authenticate(launchUrl) {
-  const response = await fetch(launchUrl, { redirect: 'manual' })
+  const response = await fetch(launchUrl, { redirect: 'manual', signal: AbortSignal.timeout(15_000) })
   const cookie = response.headers.get('set-cookie')
   await response.body?.cancel()
   if (response.status !== 303 || cookie === null) throw new Error('Host authentication failed')

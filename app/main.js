@@ -8,12 +8,13 @@
  */
 import { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, shell, session, systemPreferences } from 'electron'
 import { join } from 'node:path'
-import { appendFile, chmod, readFile } from 'node:fs/promises'
+import { appendFile, chmod, mkdir, readFile } from 'node:fs/promises'
 import { cpus, totalmem } from 'node:os'
 import { fileURLToPath } from 'node:url'
+import { createHash } from 'node:crypto'
 import { loadConfig, updateConfig, slug, nextLocalPort, HOST_DEFAULTS } from './lib/config.js'
 import { launchScript, parseLaunchUrl, localLaunchUrl, redact } from './lib/launch.js'
-import { Tunnel, runRemote } from './lib/tunnel.js'
+import { Tunnel, LoopbackProxy, runRemote } from './lib/tunnel.js'
 import { authenticate, hostRpc, hasConfiguredApiKey } from './lib/host-rpc.js'
 import { watchAccountSignIn } from './lib/account-watch.js'
 import { probeScript, parseProbe, setupScript } from './lib/server-setup.js'
@@ -53,6 +54,26 @@ let connectGeneration = 0
 let lastSignInOpen = 0
 /** Sign-in popups of the current window; closed when the window changes server. */
 const popups = new Set()
+/** One app-owned listener per server port, bound for the life of the app (see lib/tunnel.js). */
+const proxies = new Map()
+function proxyFor(host) {
+  let proxy = proxies.get(host.localPort)
+  if (proxy === undefined) { proxy = new LoopbackProxy(host.localPort); proxies.set(host.localPort, proxy) }
+  return proxy
+}
+/** Private (0700) directory for the ssh forward sockets. */
+async function socketDir() {
+  const dir = join(app.getPath('userData'), 'sockets')
+  await mkdir(dir, { recursive: true, mode: 0o700 })
+  await chmod(dir, 0o700)
+  return dir
+}
+/** Retire everything that holds the current server's credentials. */
+function retireSession() {
+  stopAccountWatch?.()
+  stopAccountWatch = undefined
+  invokeHost = undefined
+}
 let quitting = false
 let reconnecting = false
 
@@ -76,7 +97,13 @@ function appOrigin() { return `http://127.0.0.1:${activeHost().localPort}` }
  * Each server gets its own persistent browser session: cookies ignore ports, so separate
  * loopback ports alone would send one server's auth cookie to another.
  */
-function hostPartition(host) { return `persist:dsh-remote-${host.id}` }
+/**
+ * The partition is tied to the server's SSH destination as well as its id: pointing an entry at
+ * another host (in Settings or by editing remote.json) gives it a fresh, empty session.
+ */
+function hostPartition(host) {
+  return `persist:dsh-remote-${host.id}-${createHash('sha256').update(host.sshHost).digest('hex').slice(0, 12)}`
+}
 const configuredSessions = new Set()
 function hostSession(host) {
   const ses = session.fromPartition(hostPartition(host))
@@ -117,6 +144,12 @@ main{max-width:560px;padding:24px}h1{font-size:18px;color:#fff}pre{white-space:p
   return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`
 }
 
+/** Load a page; a load replaced by a newer one rejects with ERR_ABORTED, which is expected. */
+function show(window, url) {
+  if (window === undefined || window.isDestroyed()) return
+  window.loadURL(url).catch((error) => { if (error?.code !== 'ERR_ABORTED') log(`load failed: ${error.message}`) })
+}
+
 /** True for URLs served by the remote dsh through the tunnel. */
 function isAppUrl(url) {
   try { return new URL(url).origin === appOrigin() } catch { return false }
@@ -144,24 +177,31 @@ class Superseded extends Error {}
  *   attempt makes every later step of this one stop and release what it opened.
  */
 async function connect(generation) {
-  const current = () => generation === connectGeneration && !quitting
+  const owner = mainWindow
+  const current = () => generation === connectGeneration && !quitting && owner === mainWindow && owner !== undefined && !owner.isDestroyed()
   const host = activeHost()
   const out = await runRemote(host.sshHost, launchScript(host))
   if (!current()) throw new Superseded()
   const launch = parseLaunchUrl(out)
   if (launch === undefined) throw new Error(`no "dsh web" launch line in ${host.serverLog} on ${host.sshHost}; use Settings → Remote servers → Set up server`)
-  tunnel?.stop()
+  await tunnel?.stop()
+  tunnel = undefined
+  if (!current()) throw new Superseded()
   let started = false
+  const socketPath = join(await socketDir(), `${host.id}.sock`)
   const opened = new Tunnel(host.sshHost, host.localPort, launch, (code, stderr) => {
     log(`tunnel exited code=${String(code)} ${stderr}`)
-    // A failed start is reported by start() itself; only a drop after a working start reconnects.
-    if (!started || tunnel !== opened) return
+    // A failed start is reported by start() itself; only a drop of the forward this window is
+    // still using reconnects, and only if nothing newer has started meanwhile.
+    if (!started || tunnel !== opened || generation !== connectGeneration) return
     tunnel = undefined
+    // Nothing that carries this server's cookie may outlive its tunnel.
+    retireSession()
     if (mainWindow !== undefined && !mainWindow.isDestroyed() && isAppUrl(mainWindow.webContents.getURL())) {
-      void mainWindow.loadURL(statusPage(`Reconnecting to ${host.name}…`, ''))
+      show(mainWindow, statusPage(`Reconnecting to ${host.name}…`, ''))
     }
     void reconnect()
-  })
+  }, { proxy: proxyFor(host), socketPath })
   tunnel = opened
   try { await opened.start() } catch (error) {
     if (tunnel === opened) tunnel = undefined
@@ -174,15 +214,16 @@ async function connect(generation) {
   globalThis.__DSH_REMOTE_APP_ORIGIN__ = appOrigin()
   const url = localLaunchUrl(host.localPort, launch.token)
   const cookie = await authenticate(url)
-  if (!current()) throw new Superseded()
+  if (!current()) { opened.stop(); if (tunnel === opened) tunnel = undefined; throw new Superseded() }
   invokeHost = hostRpc(appOrigin(), cookie)
   stopAccountWatch?.()
   stopAccountWatch = watchAccountSignIn(appOrigin(), cookie, {
     open: (target) => {
-      if (mainWindow === undefined || mainWindow.isDestroyed() || !mainWindow.isFocused()) { log('sign-in page not opened: window not focused'); return }
-      if (Date.now() - lastSignInOpen < 10_000) return
+      if (mainWindow === undefined || mainWindow.isDestroyed() || !mainWindow.isFocused()) { log('sign-in page not opened: window not focused'); return false }
+      if (Date.now() - lastSignInOpen < 10_000) return false
       lastSignInOpen = Date.now()
       void shell.openExternal(target)
+      return true
     },
     theme: () => nativeTheme.shouldUseDarkColors ? 'dark' : 'light',
     log,
@@ -190,33 +231,49 @@ async function connect(generation) {
   return url
 }
 
+/** @returns {Promise<boolean>} false when the connection failed and the error page is showing. */
 async function openApp() {
-  if (mainWindow === undefined || mainWindow.isDestroyed()) return
+  if (mainWindow === undefined || mainWindow.isDestroyed()) return true
   const generation = ++connectGeneration
   const host = activeHost()
   mainWindow.setTitle(`DeepSeek Harness — ${host.name}`)
-  void mainWindow.loadURL(statusPage(`Connecting to ${host.name}…`, ''))
+  show(mainWindow, statusPage(`Connecting to ${host.name}…`, ''))
   try {
     const url = await connect(generation)
-    if (generation === connectGeneration) await mainWindow?.loadURL(url)
+    if (generation === connectGeneration && mainWindow !== undefined && !mainWindow.isDestroyed()) {
+      await mainWindow.loadURL(url).catch((error) => { if (error?.code !== 'ERR_ABORTED') throw error })
+    }
+    return true
   } catch (error) {
-    if (error instanceof Superseded || generation !== connectGeneration) return
+    if (error instanceof Superseded || generation !== connectGeneration) return true
     log(`connect failed: ${error.message}`)
     const others = config.hosts.filter(item => item.id !== host.id).map(item => item.name).join(', ')
-    void mainWindow?.loadURL(statusPage(`Cannot reach DeepSeek Harness on ${host.name}`,
+    show(mainWindow, statusPage(`Cannot reach DeepSeek Harness on ${host.name}`,
       `${redact(error.message)}\n\nNot set up yet? Connection → Set up this server…\nReconnect: Cmd+Shift+R${others ? `\nSwitch server: Connection menu (${others})` : ''}\nAdd servers before any is set up: Connection → Open settings file`))
+    return false
   }
 }
 
 /** Show another server in this window; the previous tunnel and account watch are closed first. */
-async function switchHost(id) {
+/** Switches and removals run one at a time, so a removal never targets a server being opened. */
+let hostChange = Promise.resolve()
+function serialHostChange(change) {
+  const run = hostChange.then(change)
+  hostChange = run.catch(() => undefined)
+  return run
+}
+
+function switchHost(id) { return serialHostChange(() => switchHostNow(id)) }
+
+async function switchHostNow(id) {
   hostById(id)
   if (id === config.activeHostId && tunnel !== undefined) return
-  config = await updateConfig(configFile(), current => ({ ...current, activeHostId: id }), () => config)
+  config = await updateConfig(configFile(), (current) => {
+    if (!current.hosts.some(host => host.id === id)) throw new Error(`unknown host ${String(id)}`)
+    return { ...current, activeHostId: id }
+  }, () => config)
   connectGeneration++
-  stopAccountWatch?.()
-  stopAccountWatch = undefined
-  invokeHost = undefined
+  retireSession()
   tunnel?.stop()
   tunnel = undefined
   buildMenu()
@@ -258,10 +315,15 @@ async function confirmNative(message, detail, action) {
 async function reconnect() {
   if (quitting || reconnecting || mainWindow === undefined || mainWindow.isDestroyed()) return
   reconnecting = true
-  const generation = connectGeneration
   try {
-    await new Promise((resolve) => { setTimeout(resolve, RECONNECT_DELAY_MS) })
-    if (!quitting && generation === connectGeneration) await openApp()
+    // Back off 3 s, 6 s, 12 s … up to 60 s until a connect succeeds or something newer takes over.
+    for (let delay = RECONNECT_DELAY_MS; ; delay = Math.min(delay * 2, 60_000)) {
+      const generation = connectGeneration
+      await new Promise((resolve) => { setTimeout(resolve, delay) })
+      // Anything newer (a switch, a manual reconnect, a closed window) takes over.
+      if (quitting || generation !== connectGeneration || tunnel !== undefined || mainWindow === undefined || mainWindow.isDestroyed()) return
+      if (await openApp()) return
+    }
   } finally { reconnecting = false }
 }
 
@@ -336,7 +398,18 @@ function createWindow(bounds) {
     if (/^https?:\/\//u.test(url)) void shell.openExternal(url)
   })
   shortcuts.attach(window)
-  window.on('closed', () => { if (mainWindow === window) mainWindow = undefined })
+  window.on('closed', () => {
+    if (mainWindow !== window) return
+    mainWindow = undefined
+    connectGeneration++
+    stopAccountWatch?.()
+    stopAccountWatch = undefined
+    invokeHost = undefined
+    void tunnel?.stop()
+    tunnel = undefined
+  })
+  // A sign-in the app held back while unfocused is offered when the user returns.
+  window.on('focus', () => { stopAccountWatch?.retry?.() })
   void openApp()
 }
 
@@ -402,9 +475,23 @@ function installIpc() {
     const host = hostById(id)
     if (host.id === config.activeHostId) throw new Error('switch to another server before removing this one')
     if (!await confirmNative(`Remove "${host.name}" from this app?`, `SSH host: ${host.sshHost}\nNothing on the server is deleted.`, 'Remove')) throw new Error('cancelled')
-    config = await updateConfig(configFile(), current => ({ ...current, hosts: current.hosts.filter(item => item.id !== host.id) }), () => config)
-    // A later server added under the same id must not inherit this one's cookies or storage.
-    await session.fromPartition(hostPartition(host)).clearStorageData().catch(() => undefined)
+    await serialHostChange(async () => {
+      if (config.activeHostId === host.id) throw new Error('switch to another server before removing this one')
+      // Clear the server's cookies and storage first: if that fails, the entry stays and its id
+      // cannot be reused by a new server.
+      try {
+        const ses = session.fromPartition(hostPartition(host))
+        await ses.clearStorageData()
+        await ses.clearCache()
+      } catch (error) {
+        log(`remove ${host.id}: clearing its session failed: ${error.message}`)
+        throw new Error(`could not clear this server's saved session (${error.message}); it was not removed`)
+      }
+      config = await updateConfig(configFile(), (current) => {
+        if (current.activeHostId === host.id) throw new Error('switch to another server before removing this one')
+        return { ...current, hosts: current.hosts.filter(item => item.id !== host.id) }
+      }, () => config)
+    })
     log(`removed host ${host.id}`)
     buildMenu()
     return config
@@ -503,6 +590,12 @@ else {
     app.on('activate', () => { if (mainWindow === undefined) createWindow(); else mainWindow.show() })
   }).catch((error) => { dialog.showErrorBox('DeepSeek Harness Remote', String(error)); app.exit(1) })
   app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
-  app.on('before-quit', () => { quitting = true; connectGeneration++; stopAccountWatch?.(); tunnel?.stop() })
+  app.on('before-quit', () => {
+    quitting = true
+    connectGeneration++
+    retireSession()
+    void tunnel?.stop()
+    for (const proxy of proxies.values()) proxy.close()
+  })
   app.on('will-quit', () => { shortcuts?.dispose() })
 }

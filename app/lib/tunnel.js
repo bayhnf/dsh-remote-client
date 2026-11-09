@@ -1,5 +1,14 @@
-/** SSH transport: one remote command runner and one local port forward. */
+/**
+ * SSH transport: one remote command runner, and per server an app-owned loopback listener that
+ * forwards to an `ssh -L` unix socket.
+ *
+ * The app binds 127.0.0.1:<localPort> itself and keeps it for as long as it runs, so no other
+ * process can take that port between a tunnel stopping and the next one starting. ssh forwards
+ * to a unix socket inside a private (0700) directory; a connection is passed on only while a
+ * tunnel whose ssh created that socket is up, and refused otherwise.
+ */
 import { spawn, execFile } from 'node:child_process'
+import { rm } from 'node:fs/promises'
 import net from 'node:net'
 
 const SSH = '/usr/bin/ssh'
@@ -31,73 +40,138 @@ export function runRemote(sshHost, script, timeoutMs = 90_000) {
   })
 }
 
-/**
- * Whether nothing listens on 127.0.0.1:port, so a tunnel can claim it.
- * @param {number} port - local port.
- * @returns {Promise<boolean>} true when the port is free.
- */
-export function isPortFree(port) {
-  return new Promise((resolve) => {
-    const server = net.createServer()
-    server.once('error', () => { resolve(false) })
-    server.listen(port, '127.0.0.1', () => { server.close(() => { resolve(true) }) })
-  })
+/** The app-owned listener on 127.0.0.1:<port>; it stays bound while the app runs. */
+export class LoopbackProxy {
+  /** @param {number} port - loopback port the window loads. */
+  constructor(port) {
+    this.port = port
+    this.server = undefined
+    this.upstream = undefined
+    this.connections = new Set()
+  }
+
+  /** Bind the port once; rejects (fails closed) when another program already holds it. */
+  listen() {
+    if (this.server !== undefined) return this.ready
+    this.server = net.createServer((client) => {
+      const path = this.upstream
+      if (path === undefined) { client.destroy(); return }
+      const upstream = net.connect(path)
+      const pair = { client, upstream }
+      this.connections.add(pair)
+      const done = () => { this.connections.delete(pair); client.destroy(); upstream.destroy() }
+      client.on('error', done).on('close', done)
+      upstream.on('error', done).on('close', done)
+      client.pipe(upstream).pipe(client)
+    })
+    this.ready = new Promise((resolve, reject) => {
+      this.server.once('error', (error) => {
+        this.server = undefined
+        reject(error.code === 'EADDRINUSE'
+          ? new Error(`port 127.0.0.1:${this.port} is in use by another program; quit it or change localPort in remote.json`)
+          : error)
+      })
+      this.server.listen(this.port, '127.0.0.1', resolve)
+    })
+    return this.ready
+  }
+
+  /** Route new connections to `path`, or refuse them; open connections to an old upstream end. */
+  setUpstream(path) {
+    if (path === this.upstream) return
+    this.upstream = path
+    for (const { client, upstream } of this.connections) { client.destroy(); upstream.destroy() }
+    this.connections.clear()
+  }
+
+  /** Release the port (the server was removed or the app is quitting). */
+  close() {
+    this.setUpstream(undefined)
+    this.server?.close()
+    this.server = undefined
+  }
 }
 
-function canConnect(port) {
+function canConnectPath(path) {
   return new Promise((resolve) => {
-    const socket = net.connect(port, '127.0.0.1')
+    const socket = net.connect(path)
     socket.once('connect', () => { socket.destroy(); resolve(true) })
     socket.once('error', () => { resolve(false) })
   })
 }
 
-/** One `ssh -N -L` forward from 127.0.0.1:localPort to the server's web listener. */
+/** One `ssh -N -L <private socket>:<listener>` forward, exposed through a LoopbackProxy. */
 export class Tunnel {
   /**
    * @param {string} sshHost - validated destination.
-   * @param {number} localPort - loopback port on this Mac.
+   * @param {number} localPort - loopback port of `options.proxy` (kept for logs).
    * @param {{ host: string, port: number }} target - dsh web listener as seen from the server.
    * @param {(code: number | null, stderr: string) => void} onExit - unexpected exit after start.
+   * @param {{ proxy?: LoopbackProxy, socketPath?: string, ssh?: string }} [options] - the app-owned
+   *   listener, a socket path inside a private directory, and the ssh binary (tests).
    */
-  constructor(sshHost, localPort, target, onExit) {
+  constructor(sshHost, localPort, target, onExit, options = {}) {
     this.sshHost = sshHost
     this.localPort = localPort
     this.target = target
     this.onExit = onExit
+    this.proxy = options.proxy
+    this.socketPath = options.socketPath
+    this.ssh = options.ssh ?? SSH
     this.child = undefined
     this.stopping = false
     this.stderr = ''
   }
 
-  /** @returns {Promise<void>} resolves once the forward accepts connections. */
+  /** @returns {Promise<void>} resolves once ssh's forward accepts connections and the proxy uses it. */
   async start() {
-    if (!await isPortFree(this.localPort)) throw new Error(`port 127.0.0.1:${this.localPort} is already in use; quit the other program or change localPort in remote.json`)
-    const forward = `127.0.0.1:${this.localPort}:${this.target.host}:${this.target.port}`
-    const child = spawn(SSH, [...SSH_OPTIONS, '-o', 'ExitOnForwardFailure=yes', '-N', '-L', forward, '--', this.sshHost], { stdio: ['ignore', 'ignore', 'pipe'] })
+    if (this.proxy === undefined || this.socketPath === undefined) throw new Error('tunnel needs an app-owned proxy and a private socket path')
+    await this.proxy.listen()
+    await rm(this.socketPath, { force: true })
+    const forward = `${this.socketPath}:${this.target.host}:${this.target.port}`
+    // ControlMaster/ControlPath off: with connection sharing, ssh hands the forward to a master
+    // process and exits at once, so this process would no longer own (or report on) the forward.
+    const child = spawn(this.ssh, [...SSH_OPTIONS, '-o', 'ControlMaster=no', '-o', 'ControlPath=none',
+      '-o', 'ExitOnForwardFailure=yes', '-o', 'StreamLocalBindUnlink=yes',
+      '-o', 'StreamLocalBindMask=0177', '-N', '-L', forward, '--', this.sshHost], { stdio: ['ignore', 'ignore', 'pipe'] })
     this.child = child
     this.stopping = false
     child.stderr.setEncoding('utf8')
     child.stderr.on('data', (chunk) => { this.stderr = (this.stderr + chunk).slice(-4096) })
     let exited = false
+    let ready = false
+    this.exited = new Promise((resolve) => { child.once('exit', resolve) })
     child.once('exit', (code) => {
       exited = true
-      if (!this.stopping) this.onExit(code, this.stderr.trim())
+      if (this.proxy?.upstream === this.socketPath) this.proxy.setUpstream(undefined)
+      // Only a drop after a successful start is reported here; start() reports its own failure.
+      if (ready && !this.stopping) this.onExit(code, this.stderr.trim())
     })
     const deadline = Date.now() + READY_TIMEOUT_MS
     while (Date.now() < deadline) {
       if (exited) throw new Error(`ssh tunnel exited: ${this.stderr.trim() || 'no output'}`)
-      if (await canConnect(this.localPort)) return
-      await new Promise((resolve) => { setTimeout(resolve, 250) })
+      // Only this user can create the socket inside the private directory.
+      if (await canConnectPath(this.socketPath)) {
+        if (exited) break
+        ready = true
+        this.proxy.setUpstream(this.socketPath)
+        return
+      }
+      await new Promise((resolve) => { setTimeout(resolve, 200) })
     }
-    this.stop()
-    throw new Error('ssh tunnel did not open within 20 s')
+    await this.stop()
+    throw new Error(exited ? `ssh tunnel exited: ${this.stderr.trim() || 'no output'}` : 'ssh tunnel did not open within 20 s')
   }
 
-  /** Stop the forward; does not report through onExit. */
+  /** @returns {Promise<void>} stops routing at once, then resolves once ssh has exited. */
   stop() {
     this.stopping = true
-    this.child?.kill('SIGTERM')
+    if (this.proxy !== undefined && this.proxy.upstream === this.socketPath) this.proxy.setUpstream(undefined)
+    const exited = this.exited ?? Promise.resolve()
+    if (this.child !== undefined && this.child.exitCode === null) this.child.kill('SIGTERM')
     this.child = undefined
+    const socket = this.socketPath
+    return Promise.race([exited.then(() => undefined), new Promise((resolve) => { setTimeout(resolve, 3000) })])
+      .then(() => (socket === undefined ? undefined : rm(socket, { force: true }).catch(() => undefined)))
   }
 }
