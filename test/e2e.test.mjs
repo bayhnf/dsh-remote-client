@@ -101,6 +101,20 @@ async function openPage(chrome, profileDir, own) {
   }
 }
 
+/**
+ * Run cleanups newest first. Each is awaited once, all of them run even when some fail, and the
+ * failures are then reported together. Cleanups are idempotent (they check whether their process
+ * is still running), so running one again from an outer hook is harmless.
+ */
+async function runCleanups(cleanups) {
+  const failures = []
+  for (const cleanup of [...cleanups].reverse()) {
+    try { await cleanup() } catch (error) { failures.push(error) }
+  }
+  cleanups.length = 0
+  if (failures.length > 0) throw new AggregateError(failures, `${failures.length} test cleanup(s) failed`)
+}
+
 async function until(read, label, ms = 30_000) {
   const deadline = Date.now() + ms
   for (;;) {
@@ -111,9 +125,16 @@ async function until(read, label, ms = 30_000) {
   }
 }
 
-test('a browser that never becomes ready, or refuses DevTools, fails promptly and leaves no process behind', { timeout: 60_000 }, async () => {
+test('a browser that never becomes ready, or refuses DevTools, fails promptly and leaves no process behind', { timeout: 60_000 }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dshrc-e2e-ctl-'))
-  try {
+  // Every fake browser is stopped after the test, whatever its assertions did, before the
+  // directory holding it is removed.
+  const cleanups = []
+  t.after(async () => {
+    await runCleanups(cleanups)
+    await rm(dir, { recursive: true, force: true })
+  })
+  {
     const { writeFile } = await import('node:fs/promises')
     // Never announces DevTools; ignores SIGTERM for a moment.
     const silent = join(dir, 'silent.mjs')
@@ -122,16 +143,16 @@ test('a browser that never becomes ready, or refuses DevTools, fails promptly an
     const refusing = join(dir, 'refusing.mjs')
     await writeFile(refusing, `#!${process.execPath}\nimport http from 'node:http'\nconst s = http.createServer((q, r) => { r.writeHead(400); r.end() }).listen(0, '127.0.0.1', () => process.stderr.write('DevTools listening on ws://127.0.0.1:' + s.address().port + '/devtools/browser/x\\\\n'))\nprocess.on('SIGTERM', () => process.exit(0))\n`, { mode: 0o700 })
     for (const [fake, expected] of [[silent, /Chromium startup/u], [refusing, /DevTools/u]]) {
-      const cleanups = []
+      const own = []
       const started = Date.now()
-      await assert.rejects(openPage(fake, join(dir, 'profile'), c => { cleanups.push(c) }), expected)
-      for (const cleanup of cleanups) await cleanup()
+      await assert.rejects(openPage(fake, join(dir, 'profile'), (cleanup) => { own.push(cleanup); cleanups.push(cleanup) }), expected)
+      await runCleanups(own)
       assert.ok(Date.now() - started < 30_000, 'failed within its bound')
       // The fake writes nothing else; look for any process still running it (not this shell).
       const alive = execFileSync('ps', ['-eo', 'pid=,args='], { encoding: 'utf8' }).split('\n').filter(line => line.includes(fake) && !/\bps\b/u.test(line))
       assert.deepEqual(alive, [], 'no browser process is left')
     }
-  } finally { await rm(dir, { recursive: true, force: true }) }
+  }
 })
 
 test('the bundle installs with dsh plugin add and its Remote servers page renders in the real Web UI', { timeout: 240_000 }, async (t) => {
@@ -146,7 +167,7 @@ test('the bundle installs with dsh plugin add and its Remote servers page render
   const cleanups = []
   const own = cleanup => { cleanups.push(cleanup) }
   t.after(async () => {
-    for (const cleanup of cleanups.reverse()) await cleanup().catch(() => undefined)
+    await runCleanups(cleanups)
     await rm(home, { recursive: true, force: true }).catch(() => undefined)
   })
   {

@@ -460,10 +460,13 @@ test('D05: after a failed scan, Remove succeeds once storage recovers, erases ev
       assert.equal(t.fake.sessions.get(`persist:${name}`)?.cleared, 1, `${name} cleared`)
     }
     assert.equal(JSON.parse(await readFile(join(t.userData, 'sessions.json'), 'utf8')).b, undefined, 'B is no longer remembered')
-    // Re-adding a server under the same id remembers no session for it.
+    const onDisk = async () => JSON.parse(await readFile(join(t.userData, 'remote.json'), 'utf8')).hosts.map(host => host.id)
+    assert.deepEqual(await onDisk(), ['a'], 'B is removed from the settings')
+    // Re-adding a server named b gets the freed id b (not b-2) and no remembered session.
     t.fake.dialogAnswers.push(0)
     const config = await t.fake.invoke(t.current(), 'dsh-remote:add', { name: 'b', sshHost: 'host-b' })
-    assert.ok(config.hosts.some(host => host.id === 'b'))
+    assert.deepEqual(config.hosts.map(host => host.id), ['a', 'b'])
+    assert.deepEqual(await onDisk(), ['a', 'b'])
     assert.equal(JSON.parse(await readFile(join(t.userData, 'sessions.json'), 'utf8')).b, undefined)
   } finally { t.quit() }
 })
