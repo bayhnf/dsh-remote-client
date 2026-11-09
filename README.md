@@ -22,7 +22,7 @@ Mac: DeepSeek Harness Remote.app ──ssh -L 127.0.0.1:43080──▶ server: d
 ```
 
 1. The app reads `remote.json`, picks the active server, and over SSH starts its `dsh-server.service` if needed. It then reads the newest `dsh web: http://…/?token=…` line from the server log.
-2. It opens `ssh -N -L 127.0.0.1:<localPort>:<listener>`. Each server gets its own local port, so cookies and page storage never mix.
+2. It opens `ssh -N -L 127.0.0.1:<localPort>:<listener>`. Each server gets its own local port and its own persistent browser session, so cookies and page storage never mix (cookies ignore ports, so the session is what separates them). Removing a server clears its session.
 3. It loads `http://127.0.0.1:<localPort>/?token=…`. The server exchanges the token for a session cookie and serves its own Web UI.
 4. If the tunnel drops, the app reconnects after 3 s. Cmd+Shift+R reconnects by hand.
 
@@ -41,7 +41,7 @@ The repository has two parts:
 ## Build
 
 ```sh
-git clone https://github.com/<you>/dsh-remote-client && cd dsh-remote-client
+git clone https://github.com/bayhnf/dsh-remote-client && cd dsh-remote-client
 (cd plugin && npm i --no-save esbuild && node build.mjs)   # builds the settings page bundle
 ./build-mac.sh                                               # -> ~/Applications/DeepSeek Harness Remote.app
 ```
@@ -59,7 +59,7 @@ mkdir -p ~/dsh-remote-work
 ditto -c -k --keepParent "/Applications/DeepSeek Harness.app" ~/dsh-remote-work/DeepSeek-Harness-<version>.app.zip
 ```
 
-`build-mac.sh` uses the newest such zip when `/Applications/DeepSeek Harness.app` is absent. Rebuild after a new official release to pick up its Electron and Web UI.
+`build-mac.sh` uses the newest such zip when `/Applications/DeepSeek Harness.app` is absent, and keeps the previous app until the new build is complete. Rebuild after a new official release to pick up its Electron runtime; the Web UI itself comes from each server, so update DSH on the server to update the UI.
 
 ## First run
 
@@ -71,13 +71,15 @@ ditto -c -k --keepParent "/Applications/DeepSeek Harness.app" ~/dsh-remote-work/
      User you
    ```
 
-2. Open **DeepSeek Harness Remote**. If the server is not set up yet, open **Account menu → Settings → Remote servers** and click **Set up server**.
-3. Add more servers on the same page. Use any `~/.ssh/config` alias (suggested as you type) or `user@host`.
+2. Open **DeepSeek Harness Remote**. If the server is not set up yet, the window shows a connection error: choose **Connection → Set up this server…** in the menu bar. It works before any server UI is available.
+3. Once connected, add more servers in **Account menu → Settings → Remote servers**. Use **From ~/.ssh/config** to pick an alias, or type `user@host`. To add a server before any server is set up, edit the settings file (**Connection → Open settings file**).
+
+Adding, removing, switching and setting up servers each ask for confirmation in a native macOS dialog, so a page served by one server cannot act on your other servers.
 
 | Action | Effect |
 |---|---|
 | Check | Reports Node, dsh, dsh-tui, the service state, and whether this page's bundle is installed |
-| Set up server | Installs only what is missing; never upgrades an installed dsh or replaces an existing service |
+| Set up server | Installs only what is missing (pinned: `@deepseek-ai/dsh@0.2.2-rc.1`, `@deepseek-harness-tui/dsh-tui@0.19.0`, `pnpm@10.33.0`); never upgrades an installed dsh or replaces an existing service. The service log, which holds the launch token, is owner-only |
 | Switch | Closes the current tunnel and opens the chosen server in the same window |
 | Remove | Removes the entry from this Mac only; nothing on the server is deleted |
 
@@ -90,7 +92,8 @@ The server is a normal DSH install, so other clients use the same data. `dsh-tui
 ## Development
 
 ```sh
-npm test                                                       # node --test: parsing, config validation, scripts
+npm test                                                       # node --test: config, scripts, concurrency, regressions
+NODE_PATH=<dir with jsdom, react, react-dom> npm run test:plugin   # mounts the shipped settings page with real React
 node vendor/build-desktop-keyboard.mjs <deepseek-harness checkout>   # refresh the bundled keyboard bridge
 ```
 

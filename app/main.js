@@ -50,6 +50,9 @@ let invokeHost
 let stopAccountWatch
 /** Bumped by every openApp(); an older in-flight connect sees the change and stops. */
 let connectGeneration = 0
+let lastSignInOpen = 0
+/** Sign-in popups of the current window; closed when the window changes server. */
+const popups = new Set()
 let quitting = false
 let reconnecting = false
 
@@ -148,9 +151,11 @@ async function connect(generation) {
   const launch = parseLaunchUrl(out)
   if (launch === undefined) throw new Error(`no "dsh web" launch line in ${host.serverLog} on ${host.sshHost}; use Settings → Remote servers → Set up server`)
   tunnel?.stop()
+  let started = false
   const opened = new Tunnel(host.sshHost, host.localPort, launch, (code, stderr) => {
     log(`tunnel exited code=${String(code)} ${stderr}`)
-    if (tunnel !== opened) return
+    // A failed start is reported by start() itself; only a drop after a working start reconnects.
+    if (!started || tunnel !== opened) return
     tunnel = undefined
     if (mainWindow !== undefined && !mainWindow.isDestroyed() && isAppUrl(mainWindow.webContents.getURL())) {
       void mainWindow.loadURL(statusPage(`Reconnecting to ${host.name}…`, ''))
@@ -158,8 +163,13 @@ async function connect(generation) {
     void reconnect()
   })
   tunnel = opened
-  await opened.start()
-  if (!current()) { opened.stop(); throw new Superseded() }
+  try { await opened.start() } catch (error) {
+    if (tunnel === opened) tunnel = undefined
+    opened.stop()
+    throw error
+  }
+  started = true
+  if (!current()) { opened.stop(); if (tunnel === opened) tunnel = undefined; throw new Superseded() }
   log(`connected ${host.id} (${host.sshHost}) -> ${launch.host}:${launch.port} on 127.0.0.1:${host.localPort}`)
   globalThis.__DSH_REMOTE_APP_ORIGIN__ = appOrigin()
   const url = localLaunchUrl(host.localPort, launch.token)
@@ -168,7 +178,12 @@ async function connect(generation) {
   invokeHost = hostRpc(appOrigin(), cookie)
   stopAccountWatch?.()
   stopAccountWatch = watchAccountSignIn(appOrigin(), cookie, {
-    open: target => { void shell.openExternal(target) },
+    open: (target) => {
+      if (mainWindow === undefined || mainWindow.isDestroyed() || !mainWindow.isFocused()) { log('sign-in page not opened: window not focused'); return }
+      if (Date.now() - lastSignInOpen < 10_000) return
+      lastSignInOpen = Date.now()
+      void shell.openExternal(target)
+    },
     theme: () => nativeTheme.shouldUseDarkColors ? 'dark' : 'light',
     log,
   })
@@ -207,6 +222,7 @@ async function switchHost(id) {
   buildMenu()
   // The window belongs to the previous server's session; open the next one in its own.
   const previous = mainWindow
+  for (const popup of popups) if (!popup.isDestroyed()) popup.close()
   createWindow(previous !== undefined && !previous.isDestroyed() ? previous.getBounds() : undefined)
   if (previous !== undefined && !previous.isDestroyed()) previous.destroy()
 }
@@ -303,8 +319,9 @@ function createWindow(bounds) {
   contents.on('will-navigate', (event, url) => { if (isAppUrl(url) && tunnel === undefined) event.preventDefault() })
   contents.on('did-create-window', (child) => {
     // The popup is only a hand-off point for the sign-in page; never let it linger in the background.
+    popups.add(child)
     const closeTimer = setTimeout(() => { if (!child.isDestroyed()) child.close() }, 30_000)
-    child.on('closed', () => { clearTimeout(closeTimer) })
+    child.on('closed', () => { clearTimeout(closeTimer); popups.delete(child) })
     child.webContents.on('will-navigate', (event, url) => {
       event.preventDefault()
       if (/^https?:\/\//u.test(url)) void shell.openExternal(url)
@@ -449,7 +466,7 @@ function buildMenu() {
           })
         } },
         { label: 'Reconnect', accelerator: 'CmdOrCtrl+Shift+R', click: () => { void openApp() } },
-        { label: 'Reload page', click: () => { mainWindow?.webContents.reload() } },
+        { label: 'Reload page', click: () => { if (tunnel !== undefined) mainWindow?.webContents.reload() } },
         { type: 'separator' },
         { label: 'Open settings file', click: () => { void shell.openPath(configFile()) } },
         { label: 'Open log', click: () => { void shell.openPath(logFile()) } },

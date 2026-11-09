@@ -17,7 +17,7 @@
 ## 工作原理
 
 1. 应用读取 `remote.json`，选中当前服务器，通过 SSH 在需要时启动其 `dsh-server.service`，并从服务器日志读取最新的 `dsh web: http://…/?token=…` 行。
-2. 打开 `ssh -N -L 127.0.0.1:<本地端口>:<监听地址>`。每台服务器使用独立的本地端口，Cookie 和页面存储互不混用。
+2. 打开 `ssh -N -L 127.0.0.1:<本地端口>:<监听地址>`。每台服务器使用独立的本地端口和独立的持久化浏览器会话，Cookie 和页面存储互不混用（Cookie 不区分端口，因此由会话隔离）。移除服务器时会清除其会话。
 3. 加载 `http://127.0.0.1:<本地端口>/?token=…`，服务器用令牌换取会话 Cookie，并提供自身的 Web UI。
 4. 隧道断开后 3 秒自动重连；Cmd+Shift+R 手动重连。
 
@@ -34,7 +34,7 @@
 ## 构建
 
 ```sh
-git clone https://github.com/<you>/dsh-remote-client && cd dsh-remote-client
+git clone https://github.com/bayhnf/dsh-remote-client && cd dsh-remote-client
 (cd plugin && npm i --no-save esbuild && node build.mjs)
 ./build-mac.sh      # -> ~/Applications/DeepSeek Harness Remote.app
 ```
@@ -58,8 +58,10 @@ ditto -c -k --keepParent "/Applications/DeepSeek Harness.app" ~/dsh-remote-work/
      User you
    ```
 
-2. 打开 **DeepSeek Harness Remote**。若服务器尚未配置，打开 **账户菜单 → 设置 → 远程服务器**，点击 **配置服务器**。
-3. 在同一页面添加更多服务器，可使用 `~/.ssh/config` 中的别名（输入时会提示）或 `user@host`。
+2. 打开 **DeepSeek Harness Remote**。若服务器尚未配置，窗口会显示连接错误：在菜单栏选择 **Connection → Set up this server…**，此操作在服务器界面可用之前即可使用。
+3. 连接后，在 **账户菜单 → 设置 → 远程服务器** 中添加更多服务器，可点击 **来自 ~/.ssh/config** 选择别名，或输入 `user@host`。在尚无可用服务器时添加服务器，请编辑设置文件（**Connection → Open settings file**）。
+
+添加、移除、切换和配置服务器都需要在 macOS 原生对话框中确认，因此某台服务器提供的页面无法操作你的其他服务器。
 
 设置保存在 `~/Library/Application Support/DeepSeek Harness Remote/remote.json`。所有值在进入 `ssh` 命令行或远程 shell 之前都会被校验，页面只能通过 id 引用服务器。
 

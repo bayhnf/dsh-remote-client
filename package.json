@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/launch.test.js",
+    "test:plugin": "node --test test/plugin.test.mjs",
     "build:mac": "./build-mac.sh"
   }
 }

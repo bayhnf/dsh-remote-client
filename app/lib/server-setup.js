@@ -11,6 +11,13 @@
 
 /** Marker printed before the JSON report so login-shell noise cannot break parsing. */
 const REPORT = '@@DSH-REMOTE-REPORT@@'
+
+/** Versions setup installs when they are missing; the versions this project is tested with. */
+export const PINNED = Object.freeze({
+  dsh: '@deepseek-ai/dsh@0.2.2-rc.1',
+  dshTui: '@deepseek-harness-tui/dsh-tui@0.19.0',
+  pnpm: 'pnpm@10.33.0',
+})
 const PLUGIN = 'dsh-remote-servers'
 
 const logPath = serverLog => serverLog.startsWith('~/') ? `$HOME/${serverLog.slice(2)}` : serverLog
@@ -67,7 +74,7 @@ export function setupScript({ serverUnit, serverLog, serverPort }, pluginTarball
     'command -v node >/dev/null || { echo "Node.js 22.19+ is required on this host (install it, then retry)" >&2; exit 10; }',
     'node -e "const [a,b]=process.versions.node.split(\'.\').map(Number); process.exit(a>22||(a===22&&b>=19)?0:1)" || { echo "Node.js $(node --version) is too old; 22.19+ is required" >&2; exit 11; }',
     'command -v systemctl >/dev/null || { echo "systemd is required on this host" >&2; exit 12; }',
-    'need=""; command -v dsh >/dev/null || need="$need @deepseek-ai/dsh"; command -v dsh-tui >/dev/null || need="$need @deepseek-harness-tui/dsh-tui"',
+    `need=""; command -v dsh >/dev/null || need="$need ${PINNED.dsh}"; command -v dsh-tui >/dev/null || need="$need ${PINNED.dshTui}"`,
     'if [ -n "$need" ]; then',
     '  PREFIX=$(npm config get prefix)',
     '  if [ ! -w "$PREFIX/lib/node_modules" ] && [ ! -w "$PREFIX" ]; then PREFIX="$HOME/.npm-global"; fi',
@@ -79,7 +86,7 @@ export function setupScript({ serverUnit, serverLog, serverPort }, pluginTarball
     'if ! command -v pnpm >/dev/null; then',
     '  say "enable pnpm"',
     '  if command -v corepack >/dev/null && corepack enable --install-directory "$(dirname "$DSH")" pnpm 2>/dev/null && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 pnpm --version >/dev/null 2>&1; then :',
-    '  else npm install -g --prefix "$(npm config get prefix)" --no-fund --no-audit pnpm >/dev/null 2>&1 || npm install -g --prefix "$HOME/.npm-global" --no-fund --no-audit pnpm >/dev/null; fi',
+    `  else npm install -g --prefix "$(npm config get prefix)" --no-fund --no-audit ${PINNED.pnpm} >/dev/null 2>&1 || npm install -g --prefix "$HOME/.npm-global" --no-fund --no-audit ${PINNED.pnpm} >/dev/null; fi`,
     'fi',
     'export COREPACK_ENABLE_DOWNLOAD_PROMPT=0',
     // The log holds the reusable launch token: keep it owner-only.
