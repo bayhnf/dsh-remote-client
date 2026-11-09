@@ -41,24 +41,53 @@ async function freePort() {
   return port
 }
 
-/** Minimal DevTools-protocol client for one page. */
-async function openPage(chrome, profileDir) {
+/**
+ * Minimal DevTools-protocol client for one page. The browser is registered with `own` the moment
+ * it is spawned, so the test stops it even if startup fails. Every wait is bounded: startup,
+ * the WebSocket handshake and each request reject on timeout, browser exit or socket close.
+ */
+async function openPage(chrome, profileDir, own) {
   const proc = spawn(chrome, ['--headless', '--no-sandbox', '--remote-debugging-port=0', `--user-data-dir=${profileDir}`, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] })
-  const wsUrl = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('Chromium did not start')), 20_000)
-    proc.stderr.on('data', (chunk) => { const match = /DevTools listening on (ws:\S+)/u.exec(String(chunk)); if (match) { clearTimeout(timer); resolve(match[1]) } })
-  })
-  const socket = new WebSocket(wsUrl)
-  await new Promise(resolve => socket.addEventListener('open', resolve))
-  let next = 0
+  const exited = new Promise((resolve) => { proc.once('exit', () => resolve()); proc.once('error', () => resolve()) })
   const pending = new Map()
+  let socket
+  const failAll = (error) => { for (const reject of pending.values()) reject(error); pending.clear() }
+  own(async () => {
+    try { socket?.close() } catch { /* already closed */ }
+    failAll(new Error('page closed'))
+    if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGTERM')
+    await Promise.race([exited, new Promise(resolve => setTimeout(resolve, 5000))])
+    if (proc.exitCode === null && proc.signalCode === null) { proc.kill('SIGKILL'); await exited }
+  })
+  const bounded = (promise, ms, label) => Promise.race([
+    promise,
+    exited.then(() => { throw new Error(`Chromium exited during ${label}`) }),
+    new Promise((_, reject) => { setTimeout(() => reject(new Error(`timed out: ${label}`)), ms).unref() }),
+  ])
+  const wsUrl = await bounded(new Promise((resolve, reject) => {
+    proc.once('error', reject)
+    proc.stderr.on('data', (chunk) => { const match = /DevTools listening on (ws:\S+)/u.exec(String(chunk)); if (match) resolve(match[1]) })
+  }), 20_000, 'Chromium startup')
+  socket = new WebSocket(wsUrl)
+  await bounded(new Promise((resolve, reject) => {
+    socket.addEventListener('open', resolve, { once: true })
+    socket.addEventListener('error', () => reject(new Error('DevTools WebSocket failed')), { once: true })
+  }), 10_000, 'DevTools handshake')
+  socket.addEventListener('close', () => failAll(new Error('DevTools WebSocket closed')))
+  let next = 0
   const errors = []
   socket.addEventListener('message', (event) => {
     const message = JSON.parse(event.data)
-    if (message.id && pending.has(message.id)) { pending.get(message.id)(message); pending.delete(message.id) }
+    if (message.id && pending.has(message.id)) { pending.get(message.id)(undefined, message); pending.delete(message.id) }
     if (message.method === 'Runtime.exceptionThrown') errors.push(message.params.exceptionDetails.exception?.description ?? message.params.exceptionDetails.text)
+    // Console errors from the page count too, not only uncaught exceptions.
+    if (message.method === 'Runtime.consoleAPICalled' && message.params.type === 'error') errors.push(`console.error: ${message.params.args.map(arg => arg.value ?? arg.description).join(' ')}`)
   })
-  const send = (method, params = {}, sessionId) => new Promise((resolve) => { const id = ++next; pending.set(id, resolve); socket.send(JSON.stringify({ id, method, params, sessionId })) })
+  const send = (method, params = {}, sessionId) => bounded(new Promise((resolve, reject) => {
+    const id = ++next
+    pending.set(id, (error, message) => (error ? reject(error) : resolve(message)))
+    socket.send(JSON.stringify({ id, method, params, sessionId }))
+  }), 15_000, method)
   const { result: { targetId } } = await send('Target.createTarget', { url: 'about:blank' })
   const { result: { sessionId } } = await send('Target.attachToTarget', { targetId, flatten: true })
   await send('Runtime.enable', {}, sessionId)
@@ -69,19 +98,41 @@ async function openPage(chrome, profileDir) {
     navigate: url => send('Page.navigate', { url }, sessionId),
     /** Click the first element whose own text or aria-label matches. */
     click: pattern => evaluate(`(() => { const re = ${pattern}; const el = [...document.querySelectorAll('*')].find(e => re.test(e.getAttribute('aria-label') || '') || (e.children.length === 0 && re.test(e.textContent))); if (!el) return false; (el.closest('button,[role=menuitem],[role=button],a,[role=tab]') || el).click(); return true })()`),
-    close: () => { socket.close(); proc.kill('SIGTERM') },
   }
 }
 
 async function until(read, label, ms = 30_000) {
   const deadline = Date.now() + ms
   for (;;) {
-    const value = await read()
+    const value = await Promise.race([read(), new Promise((_, reject) => { setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), Math.max(1, deadline - Date.now())).unref() })])
     if (value) return value
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`)
     await new Promise(resolve => setTimeout(resolve, 300))
   }
 }
+
+test('a browser that never becomes ready, or refuses DevTools, fails promptly and leaves no process behind', { timeout: 60_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dshrc-e2e-ctl-'))
+  try {
+    const { writeFile } = await import('node:fs/promises')
+    // Never announces DevTools; ignores SIGTERM for a moment.
+    const silent = join(dir, 'silent.mjs')
+    await writeFile(silent, `#!${process.execPath}\nprocess.on('SIGTERM', () => setTimeout(() => process.exit(0), 200))\nsetInterval(() => {}, 1000)\n`, { mode: 0o700 })
+    // Announces a WebSocket URL whose handshake is refused (HTTP 400).
+    const refusing = join(dir, 'refusing.mjs')
+    await writeFile(refusing, `#!${process.execPath}\nimport http from 'node:http'\nconst s = http.createServer((q, r) => { r.writeHead(400); r.end() }).listen(0, '127.0.0.1', () => process.stderr.write('DevTools listening on ws://127.0.0.1:' + s.address().port + '/devtools/browser/x\\\\n'))\nprocess.on('SIGTERM', () => process.exit(0))\n`, { mode: 0o700 })
+    for (const [fake, expected] of [[silent, /Chromium startup/u], [refusing, /DevTools/u]]) {
+      const cleanups = []
+      const started = Date.now()
+      await assert.rejects(openPage(fake, join(dir, 'profile'), c => { cleanups.push(c) }), expected)
+      for (const cleanup of cleanups) await cleanup()
+      assert.ok(Date.now() - started < 30_000, 'failed within its bound')
+      // The fake writes nothing else; look for any process still running it (not this shell).
+      const alive = execFileSync('ps', ['-eo', 'pid=,args='], { encoding: 'utf8' }).split('\n').filter(line => line.includes(fake) && !/\bps\b/u.test(line))
+      assert.deepEqual(alive, [], 'no browser process is left')
+    }
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
 
 test('the bundle installs with dsh plugin add and its Remote servers page renders in the real Web UI', { timeout: 240_000 }, async (t) => {
   const chrome = findChrome()
@@ -91,9 +142,14 @@ test('the bundle installs with dsh plugin add and its Remote servers page render
   const home = await mkdtemp(join(tmpdir(), 'dshrc-e2e-'))
   await chmod(home, 0o700)
   const env = { ...process.env, HOME: home, DSH_HOME: join(home, '.dsh') }
-  let server
-  let page
-  try {
+  // Cleanups run in reverse order after the test, whether it passes, fails or times out.
+  const cleanups = []
+  const own = cleanup => { cleanups.push(cleanup) }
+  t.after(async () => {
+    for (const cleanup of cleanups.reverse()) await cleanup().catch(() => undefined)
+    await rm(home, { recursive: true, force: true }).catch(() => undefined)
+  })
+  {
     execFileSync('npm', ['pack', '--silent', '--pack-destination', home], { cwd: join(ROOT, 'plugin'), stdio: 'ignore' })
     const tarball = readdirSync(home).find(name => name.startsWith('dsh-remote-servers-') && name.endsWith('.tgz'))
     assert.ok(tarball, 'npm pack produced the bundle')
@@ -104,10 +160,16 @@ test('the bundle installs with dsh plugin add and its Remote servers page render
 
     const port = await freePort()
     const log = join(home, 'web.log')
-    server = spawn('sh', ['-c', `exec "$0" --profile e2e --host 127.0.0.1 --port ${port} --no-open > "$1" 2>&1`, dsh, log], { env, stdio: 'ignore', detached: true })
+    const server = spawn('sh', ['-c', `exec "$0" --profile e2e --host 127.0.0.1 --port ${port} --no-open > "$1" 2>&1`, dsh, log], { env, stdio: 'ignore', detached: true })
+    const serverExited = new Promise((resolve) => { server.once('exit', resolve); server.once('error', resolve) })
+    own(async () => {
+      try { process.kill(-server.pid, 'SIGTERM') } catch { /* already gone */ }
+      await Promise.race([serverExited, new Promise(resolve => setTimeout(resolve, 5000))])
+      try { process.kill(-server.pid, 'SIGKILL') } catch { /* already gone */ }
+    })
     const launch = await until(async () => /dsh web: (http:\/\/127\.0\.0\.1:\d+\/\?token=\S+)/u.exec(await readFile(log, 'utf8').catch(() => ''))?.[1], 'dsh web launch line', 90_000)
 
-    page = await openPage(chrome, join(home, 'chrome'))
+    const page = await openPage(chrome, join(home, 'chrome'), own)
     await page.navigate(launch)
     await until(() => page.evaluate('document.readyState === "complete" && /Account menu/.test([...document.querySelectorAll("[aria-label]")].map(e => e.getAttribute("aria-label")).join(" "))'), 'Web UI')
     // The preview notice covers the page until it is dismissed.
@@ -121,11 +183,6 @@ test('the bundle installs with dsh plugin add and its Remote servers page render
     const text = await until(async () => { const value = await page.evaluate('[...document.querySelectorAll("[role=dialog]")].map(d => d.innerText).join("\\n")'); return /managed from the DeepSeek Harness Remote desktop app/u.test(value) ? value : undefined }, 'section content')
     // A plain browser tab has no desktop bridge: the page explains that instead of offering actions.
     assert.match(text, /Each server runs DeepSeek Harness itself/u)
-    assert.deepEqual(page.errors, [], 'no uncaught exception in the page')
-  } finally {
-    page?.close()
-    if (server !== undefined) { try { process.kill(-server.pid, 'SIGTERM') } catch { /* already gone */ } }
-    await new Promise(resolve => setTimeout(resolve, 300))
-    await rm(home, { recursive: true, force: true }).catch(() => undefined)
+    assert.deepEqual(page.errors, [], 'no uncaught exception or console error in the page')
   }
 })

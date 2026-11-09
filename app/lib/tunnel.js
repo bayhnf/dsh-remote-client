@@ -7,12 +7,14 @@
  * to a unix socket inside a private (0700) directory; a connection is passed on only after the
  * owner of a running tunnel routes the port to it, and refused otherwise.
  *
- * Every ssh reports which server it reached. ssh runs a KnownHostsCommand (which prints nothing,
- * so host keys are still verified against known_hosts as usual) and passes it the final
- * destination's user, host, port and host key (or host certificate) when it looks that host up by
- * name; ProxyJump and ProxyCommand hosts are separate ssh processes and are never recorded. The
- * record goes to a private file of this app, so nothing the server prints can change it. That
- * identity, not the alias text, decides which browser storage a server gets (see sessions.js).
+ * Every ssh reports which server it reached. ssh runs a KnownHostsCommand for the final
+ * destination only (ProxyJump and ProxyCommand hosts are separate ssh processes) and passes it
+ * that destination's user, host, port and host key or certificate; the app's command records
+ * those to a private file, then runs the user's own KnownHostsCommand from ~/.ssh/config, if
+ * any, with exactly the arguments ssh would have given it, so its output is still what ssh
+ * trusts (without one, host keys come from known_hosts as usual). Nothing the server sends can
+ * change the record. That identity, not the alias text, decides which browser storage a server
+ * gets (see sessions.js).
  */
 import { spawn, execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'

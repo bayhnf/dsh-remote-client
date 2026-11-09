@@ -42,7 +42,13 @@ registerHooks({
     }
     if (url.startsWith(pathToFileURL(join(APP, 'main.js')).href)) {
       const ssh = new URL(url).searchParams.get('ssh')
-      const source = readFileSync(join(APP, 'main.js'), 'utf8').replace("from './lib/tunnel.js'", `from ${JSON.stringify(`${TUNNEL}?ssh=${encodeURIComponent(ssh)}`)}`)
+      let source = readFileSync(join(APP, 'main.js'), 'utf8').replace("from './lib/tunnel.js'", `from ${JSON.stringify(`${TUNNEL}?ssh=${encodeURIComponent(ssh)}`)}`)
+      // A test may hold host authentication: globalThis.__authGate, when set, decides when the real
+      // authenticate() result is handed back to main.js.
+      const hostRpc = pathToFileURL(join(APP, 'lib', 'host-rpc.js')).href
+      source = source.replace("import { authenticate, hostRpc, hasConfiguredApiKey } from './lib/host-rpc.js'",
+        `import { authenticate as realAuthenticate, hostRpc, hasConfiguredApiKey } from ${JSON.stringify(hostRpc)}\nconst authenticate = url => realAuthenticate(url).then(cookie => (globalThis.__authGate ? globalThis.__authGate(cookie) : cookie))`)
+      if (!source.includes('realAuthenticate')) throw new Error('main.js no longer imports authenticate from host-rpc.js the way this test expects')
       return { format: 'module', shortCircuit: true, source }
     }
     return next(url, context)
@@ -399,25 +405,66 @@ test('D05: a host certificate that changes opens the server in a new session', {
   } finally { t.quit() }
 })
 
-test('D05: a forward that drops while signing in is retried, and the late sign-in never publishes', { timeout: 40000 }, async () => {
+test('D05: a sign-in that succeeds after its forward dropped never publishes, and a retry is scheduled', { timeout: 40000 }, async () => {
   const webA = await fakeDshWeb('A')
   const t = await boot({ hosts: [{ id: 'a', name: 'A', sshHost: 'host-a' }], sshHosts: { 'host-a': { key: 'KEY_A', web: webA.port } } })
   try {
     await t.until(() => t.appLoads(t.current()).length > 0, 'first page')
     const window = t.current()
     const before = t.appLoads(window).length
-    // The next sign-in hangs until the forward it travels on has been dropped.
-    webA.state.authDelayMs = 3000
+    // Hold the next successful authentication until the forward it came through is gone.
+    let release
+    const held = new Promise((resolve) => { release = resolve })
+    let reached = false
+    globalThis.__authGate = async (cookie) => { reached = true; await held; return cookie }
     const forwards = () => { try { return execFileSync('pgrep', ['-f', `${t.dir}/ssh.mjs .* -L `], { encoding: 'utf8' }).trim().split('\n').filter(Boolean) } catch { return [] } }
-    const old = new Set(forwards())
     t.click('Reconnect')
-    await t.until(() => forwards().some(pid => !old.has(pid)), 'new forward during sign-in')
-    await new Promise(resolve => setTimeout(resolve, 200))
+    await t.until(() => reached, 'authentication succeeded and is held')
     for (const pid of forwards()) process.kill(Number(pid), 'SIGTERM')
-    webA.state.authDelayMs = 0
-    await t.until(() => t.appLoads(window).length > before, 'reconnected page', 20000)
-    const body = await fetch(`http://127.0.0.1:${t.ports[0]}/check`).then(r => r.text(), () => 'REFUSED')
-    assert.equal(body, 'A')
+    await t.until(() => forwards().length === 0, 'forward exited')
+    await new Promise(resolve => setTimeout(resolve, 200))
+    globalThis.__authGate = undefined
+    release()
+    // The late success must not publish: no page load from it, and nothing routed.
+    await new Promise(resolve => setTimeout(resolve, 500))
+    assert.equal(t.appLoads(window).length, before, 'the late sign-in loaded nothing')
+    assert.match(window.loads.at(-1), /^data:/u, 'the window shows a status page')
+    const refused = await fetch(`http://127.0.0.1:${t.ports[0]}/check`).then(() => false, () => true)
+    assert.equal(refused, true, 'nothing is routed')
+    // The automatic retry then connects again.
+    await t.until(() => t.appLoads(window).length > before, 'automatic retry', 20000)
+  } finally { globalThis.__authGate = undefined; t.quit() }
+})
+
+test('D05: after a failed scan, Remove succeeds once storage recovers, erases every session, and a re-added host starts empty', { timeout: 30000 }, async () => {
+  const webA = await fakeDshWeb('A')
+  const t = await boot({
+    hosts: [{ id: 'a', name: 'A', sshHost: 'host-a' }, { id: 'b', name: 'B', sshHost: 'host-b' }],
+    sshHosts: { 'host-a': { key: 'KEY_A', web: webA.port } },
+    before: async (_fake, userData) => {
+      await writeFile(join(userData, 'sessions.json'), JSON.stringify({ b: 'persist:dsh-remote_b_1111111111111111' }))
+      await writeFile(join(userData, 'Partitions'), 'not a directory')
+    },
+  })
+  try {
+    await t.until(() => t.appLoads(t.current()).length > 0, 'A page')
+    t.fake.dialogAnswers.push(0)
+    await assert.rejects(t.fake.invoke(t.current(), 'dsh-remote:remove', 'b'), /was not removed/u)
+    // Storage recovers: an older session of B and its latest one are both on disk.
+    const { rm: remove } = await import('node:fs/promises')
+    await remove(join(t.userData, 'Partitions'))
+    for (const name of ['dsh-remote_b_0000000000000000', 'dsh-remote_b_1111111111111111', 'dsh-remote-b-0123456789ab']) await mkdir(join(t.userData, 'Partitions', name), { recursive: true })
+    t.fake.dialogAnswers.push(0)
+    await t.fake.invoke(t.current(), 'dsh-remote:remove', 'b')
+    for (const name of ['dsh-remote_b_0000000000000000', 'dsh-remote_b_1111111111111111', 'dsh-remote-b-0123456789ab']) {
+      assert.equal(t.fake.sessions.get(`persist:${name}`)?.cleared, 1, `${name} cleared`)
+    }
+    assert.equal(JSON.parse(await readFile(join(t.userData, 'sessions.json'), 'utf8')).b, undefined, 'B is no longer remembered')
+    // Re-adding a server under the same id remembers no session for it.
+    t.fake.dialogAnswers.push(0)
+    const config = await t.fake.invoke(t.current(), 'dsh-remote:add', { name: 'b', sshHost: 'host-b' })
+    assert.ok(config.hosts.some(host => host.id === 'b'))
+    assert.equal(JSON.parse(await readFile(join(t.userData, 'sessions.json'), 'utf8')).b, undefined)
   } finally { t.quit() }
 })
 
