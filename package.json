@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test --test-concurrency=1 test/launch.test.js test/plugin.test.mjs test/main.test.mjs",
+    "test": "node --test --test-concurrency=1 test/launch.test.js test/plugin.test.mjs test/main.test.mjs test/e2e.test.mjs",
     "build:mac": "./build-mac.sh"
   },
   "devDependencies": {

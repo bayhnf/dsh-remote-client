@@ -82,7 +82,8 @@ export function createFakeElectron({ userData }) {
     BrowserWindow,
     Menu: { buildFromTemplate: template => ({ template, popup() {} }), setApplicationMenu(menu) { electron.menu = menu } },
     dialog: {
-      async showMessageBox() { return { response: dialogAnswers.length > 0 ? dialogAnswers.shift() : 1 } },
+      // An answer may be a promise, so a test can hold a confirmation open while other things happen.
+      async showMessageBox() { return { response: await (dialogAnswers.length > 0 ? dialogAnswers.shift() : 1) } },
       showErrorBox(_title, message) { electron.errors.push(message) },
     },
     ipcMain: {

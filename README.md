@@ -95,7 +95,7 @@ The server is a normal DSH install, so other clients use the same data. `dsh-tui
 ## Development
 
 ```sh
-npm install && npm test        # scripts on fake servers, transport, the main-process lifecycle, and the settings page in React
+npm install && npm test        # scripts on fake servers, transport with real sshd, the main-process lifecycle, the settings page in React, and an end-to-end run in the real Web UI (needs dsh and a headless Chromium; skipped otherwise)
 node vendor/build-desktop-keyboard.mjs <deepseek-harness checkout>   # refresh the bundled keyboard bridge
 ```
 

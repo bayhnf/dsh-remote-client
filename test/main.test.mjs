@@ -64,16 +64,20 @@ async function freePort() {
  * A dsh web stand-in: `/?token=…` answers 303 with a cookie naming the server; other paths echo
  * the cookie they received, so a test can see which cookie each request carried.
  */
-async function fakeDshWeb(name) {
+async function fakeDshWeb(name, { authDelayMs = 0 } = {}) {
   const seen = []
-  const server = http.createServer((req, res) => {
+  const state = { authDelayMs }
+  const server = http.createServer(async (req, res) => {
     seen.push(req.headers.cookie ?? '')
-    if (req.url.startsWith('/?token=')) { res.writeHead(303, { 'set-cookie': `dsh-auth-x=${name}; Path=/; HttpOnly`, location: '/' }); res.end(); return }
+    if (req.url.startsWith('/?token=')) {
+      if (state.authDelayMs > 0) await new Promise(resolve => setTimeout(resolve, state.authDelayMs))
+      res.writeHead(303, { 'set-cookie': `dsh-auth-x=${name}; Path=/; HttpOnly`, location: '/' }); res.end(); return
+    }
     res.writeHead(200, { 'content-type': 'text/plain' }); res.end(name)
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   servers.push(server)
-  return { name, port: server.address().port, seen }
+  return { name, port: server.address().port, seen, state }
 }
 
 /**
@@ -96,7 +100,7 @@ const host = JSON.parse(readFileSync(${JSON.stringify(join(dir, 'hosts.json'))},
 if (args[0] === '-G') { setTimeout(() => { process.stdout.write('user me\\nhostname ' + (host?.key ?? dest) + '\\nport 22\\n'); process.exit(0) }, host?.resolveDelayMs ?? 0) }
 else {
 if (host === undefined || host.fail) { process.stderr.write((host?.fail ?? 'ssh: Could not resolve hostname') + '\\n'); process.exit(255) }
-runKnownHostsCommand(args, { user: 'me', host: dest, port: 22, keyType: 'ssh-ed25519', key: host.key })
+runKnownHostsCommand(args, { user: 'me', host: dest, port: 22, keyType: host.keyType ?? 'ssh-ed25519', key: host.key })
 const forward = args.indexOf('-L')
 if (forward < 0 && host.launchFail) { process.stderr.write(host.launchFail + '\\n'); process.exit(255) }
 if (forward < 0) {
@@ -362,4 +366,79 @@ test('Q6-3/N6-03: Remove retries a stale session whose startup clear failed, and
     assert.equal(legacy.cleared, 1)
     assert.deepEqual(JSON.parse(await readFile(join(t.userData, 'remote.json'), 'utf8')).hosts.map(host => host.id), ['a'])
   } finally { t.quit(); void dir }
+})
+
+test('D05: Remove keeps the host when the saved sessions cannot be listed', { timeout: 30000 }, async () => {
+  const webA = await fakeDshWeb('A')
+  const t = await boot({
+    hosts: [{ id: 'a', name: 'A', sshHost: 'host-a' }, { id: 'b', name: 'B', sshHost: 'host-b' }],
+    sshHosts: { 'host-a': { key: 'KEY_A', web: webA.port } },
+    // Partitions is a file, so listing it fails with ENOTDIR (not "no sessions").
+    before: async (_fake, userData) => { await writeFile(join(userData, 'Partitions'), 'not a directory') },
+  })
+  try {
+    await t.until(() => t.appLoads(t.current()).length > 0, 'A page')
+    t.fake.dialogAnswers.push(0)
+    await assert.rejects(t.fake.invoke(t.current(), 'dsh-remote:remove', 'b'), /was not removed/u)
+    assert.deepEqual(JSON.parse(await readFile(join(t.userData, 'remote.json'), 'utf8')).hosts.map(host => host.id), ['a', 'b'])
+  } finally { t.quit() }
+})
+
+test('D05: a host certificate that changes opens the server in a new session', { timeout: 30000 }, async () => {
+  const webA = await fakeDshWeb('A')
+  const cert = 'ssh-ed25519-cert-v01@openssh.com'
+  const t = await boot({ hosts: [{ id: 'a', name: 'A', sshHost: 'alias' }], sshHosts: { alias: { key: 'CERT_ONE', keyType: cert, web: webA.port } } })
+  try {
+    await t.until(() => t.appLoads(t.current()).length > 0, 'first page')
+    const first = t.current()
+    await t.setHosts({ alias: { key: 'CERT_TWO', keyType: cert, web: webA.port } })
+    t.click('Reconnect')
+    await t.until(() => t.current() !== first && t.appLoads(t.current()).length > 0, 'new window', 15000)
+    assert.notEqual(t.current().session.partition, first.session.partition)
+    assert.equal(t.appLoads(first).length, 1)
+  } finally { t.quit() }
+})
+
+test('D05: a forward that drops while signing in is retried, and the late sign-in never publishes', { timeout: 40000 }, async () => {
+  const webA = await fakeDshWeb('A')
+  const t = await boot({ hosts: [{ id: 'a', name: 'A', sshHost: 'host-a' }], sshHosts: { 'host-a': { key: 'KEY_A', web: webA.port } } })
+  try {
+    await t.until(() => t.appLoads(t.current()).length > 0, 'first page')
+    const window = t.current()
+    const before = t.appLoads(window).length
+    // The next sign-in hangs until the forward it travels on has been dropped.
+    webA.state.authDelayMs = 3000
+    const forwards = () => { try { return execFileSync('pgrep', ['-f', `${t.dir}/ssh.mjs .* -L `], { encoding: 'utf8' }).trim().split('\n').filter(Boolean) } catch { return [] } }
+    const old = new Set(forwards())
+    t.click('Reconnect')
+    await t.until(() => forwards().some(pid => !old.has(pid)), 'new forward during sign-in')
+    await new Promise(resolve => setTimeout(resolve, 200))
+    for (const pid of forwards()) process.kill(Number(pid), 'SIGTERM')
+    webA.state.authDelayMs = 0
+    await t.until(() => t.appLoads(window).length > before, 'reconnected page', 20000)
+    const body = await fetch(`http://127.0.0.1:${t.ports[0]}/check`).then(r => r.text(), () => 'REFUSED')
+    assert.equal(body, 'A')
+  } finally { t.quit() }
+})
+
+test('D05: a switch while a Remove confirmation is open makes that Remove fail, and the host stays', { timeout: 30000 }, async () => {
+  const webA = await fakeDshWeb('A')
+  const webB = await fakeDshWeb('B')
+  const t = await boot({
+    hosts: [{ id: 'a', name: 'A', sshHost: 'host-a' }, { id: 'b', name: 'B', sshHost: 'host-b' }],
+    sshHosts: { 'host-a': { key: 'KEY_A', web: webA.port }, 'host-b': { key: 'KEY_B', web: webB.port } },
+  })
+  try {
+    await t.until(() => t.appLoads(t.current()).length > 0, 'A page')
+    let confirm
+    t.fake.dialogAnswers.push(new Promise((resolve) => { confirm = resolve }))
+    const removing = t.fake.invoke(t.current(), 'dsh-remote:remove', 'b')
+    await new Promise(resolve => setTimeout(resolve, 50))
+    // While the dialog is open, the user switches to B from the menu.
+    t.click('B')
+    await t.until(() => t.fake.windows.some(w => !w.destroyed && t.appLoads(w).some(url => url.includes('tok_hostb'))), 'B page', 15000)
+    confirm(0)
+    await assert.rejects(removing, /switch to another server/u)
+    assert.deepEqual(JSON.parse(await readFile(join(t.userData, 'remote.json'), 'utf8')).hosts.map(host => host.id), ['a', 'b'])
+  } finally { t.quit() }
 })
