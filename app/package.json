@@ -1,0 +1,9 @@
+{
+  "name": "dsh-remote-client",
+  "productName": "DeepSeek Harness Remote",
+  "version": "0.1.0",
+  "description": "Thin Electron client for a DeepSeek Harness server reached over SSH",
+  "license": "MIT",
+  "type": "module",
+  "main": "main.js"
+}

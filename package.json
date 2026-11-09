@@ -1,0 +1,9 @@
+{
+  "name": "dsh-remote-client-workspace",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/launch.test.js",
+    "build:mac": "./build-mac.sh"
+  }
+}

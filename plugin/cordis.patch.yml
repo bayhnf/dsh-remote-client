@@ -1,0 +1,5 @@
+# dsh-remote-servers: the Remote servers settings page. The host half is empty; the browser
+# half (lib/client.js) registers the page and talks to the desktop client's dshRemote bridge.
+- insert:
+    - id: remote-servers
+      name: dsh-remote-servers
