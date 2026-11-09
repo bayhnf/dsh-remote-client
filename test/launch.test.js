@@ -303,6 +303,24 @@ test('SEC-07: a directory with an ACL on the log path is refused', async (t) => 
   assert.match(privateLog(join(leaf, 'x.log'), home).err, /has an ACL/u)
 })
 
+test('Q6-1/N6-01: a shared log directory under home is refused and left exactly as it was', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'dshrc-log-'))
+  for (const [name, mode] of [['world', 0o777], ['other-write', 0o757]]) {
+    const dir = join(home, name)
+    await mkdirFs(dir)
+    await chmodFs(dir, mode)
+    assert.match(privateLog(join(dir, 'x.log'), home).err, /can be changed by other users/u, name)
+    assert.equal(modeOf(dir), mode.toString(8), `${name} keeps its mode`)
+    assert.equal(existsSync(join(dir, 'x.log')), false, `${name}: no log is created`)
+  }
+  // A private directory of this user inside home is tightened; one elsewhere is left as it is.
+  const own = join(home, 'own')
+  await mkdirFs(own)
+  await chmodFs(own, 0o755)
+  assert.equal(privateLog(join(own, 'x.log'), home).code, 0)
+  assert.equal(modeOf(own), '700')
+})
+
 test('belongsTo matches only the current names of one host id', async () => {
   const { belongsTo, staleNames } = await import('../app/lib/sessions.js')
   assert.equal(belongsTo('a', 'dsh-remote_a_0123456789abcdef'), true)
@@ -798,6 +816,39 @@ test('SEC-01/N5-01: real OpenSSH through ProxyJump names the final server, so re
   } finally {
     for (const server of servers) server.kill('SIGTERM')
   }
+})
+
+test('Q6-2/N6-02: a host trusted only through the user\'s own KnownHostsCommand still connects, with its identity recorded', { timeout: 60000 }, async (t) => {
+  if (!existsSync('/usr/sbin/sshd') || !existsSync('/usr/bin/ssh-keygen')) { t.skip('needs OpenSSH server binaries'); return }
+  const dir = await mkdtemp(join(tmpdir(), 'dshrc-sshd-'))
+  await chmodFs(dir, 0o700)
+  const keygen = (file) => execFileSync('/usr/bin/ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', file])
+  keygen(join(dir, 'client'))
+  keygen(join(dir, 'host'))
+  await writeFileFs(join(dir, 'authorized_keys'), await readFileFs(join(dir, 'client.pub'), 'utf8'), { mode: 0o600 })
+  const port = await freePort()
+  await writeFileFs(join(dir, 'sshd.conf'), [`Port ${port}`, 'ListenAddress 127.0.0.1', `HostKey ${join(dir, 'host')}`, `PidFile ${join(dir, 'pid')}`,
+    `AuthorizedKeysFile ${join(dir, 'authorized_keys')}`, 'PasswordAuthentication no', 'KbdInteractiveAuthentication no', 'UsePAM no', 'StrictModes no'].join('\n'))
+  const server = spawn('/usr/sbin/sshd', ['-D', '-e', '-f', join(dir, 'sshd.conf')], { stdio: 'ignore' })
+  try {
+    // The provider prints the host key, like a dynamic known-hosts source; known_hosts is empty.
+    const hostKey = (await readFileFs(join(dir, 'host.pub'), 'utf8')).split(' ').slice(0, 2).join(' ')
+    await writeFileFs(join(dir, 'provider.sh'), `#!/bin/sh\nprintf '%s %s\\n' "$1" '${hostKey}'\n`, { mode: 0o700 })
+    const user = execFileSync('id', ['-un'], { encoding: 'utf8' }).trim()
+    await writeFileFs(join(dir, 'config'), ['Host dynamic', '  HostName 127.0.0.1', `  Port ${port}`, `  User ${user}`, `  IdentityFile ${join(dir, 'client')}`, '  IdentitiesOnly yes',
+      '  UserKnownHostsFile /dev/null', '  GlobalKnownHostsFile /dev/null', '  StrictHostKeyChecking yes', `  KnownHostsCommand ${join(dir, 'provider.sh')} %H`].join('\n'))
+    const source = (await readFileFs(new URL('../app/lib/tunnel.js', import.meta.url), 'utf8'))
+      .replace("'-o', 'BatchMode=yes',", `'-F', ${JSON.stringify(join(dir, 'config'))}, '-o', 'BatchMode=yes',`)
+      .replace("execFile(SSH, ['-G', '--', sshHost]", `execFile(SSH, ['-F', ${JSON.stringify(join(dir, 'config'))}, '-G', '--', sshHost]`)
+    const { sshRun } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)
+    await new Promise(resolve => setTimeout(resolve, 500))
+    const result = await sshRun('dynamic', 'echo connected')
+    assert.equal(result.out.trim(), 'connected')
+    assert.match(result.identity, /^[0-9a-f]{64}$/u)
+    // A provider that vouches for nothing still means no trust: ssh refuses, as without the app.
+    await writeFileFs(join(dir, 'provider.sh'), '#!/bin/sh\nexit 0\n', { mode: 0o700 })
+    await assert.rejects(sshRun('dynamic', 'true'), /Host key verification failed/u)
+  } finally { server.kill('SIGTERM') }
 })
 
 test('stop before start finishes prevents ssh from starting', { timeout: 30000 }, async () => {

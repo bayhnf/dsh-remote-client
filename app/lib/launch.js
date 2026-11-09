@@ -14,8 +14,9 @@ const LAUNCH_LINE = /dsh web: (http:\/\/\S+\/\?token=[A-Za-z0-9_-]+)/gu
  *   ACL (`+` in `ls -ld`), and cannot be written by anyone else: not other users, and not a group
  *   with other members. A sticky directory owned by root or this user (such as /tmp) is allowed
  *   above the log's directory; there others cannot rename what they do not own.
- * - The log's own directory belongs to this user and is not sticky. Inside the home directory
- *   it is tightened to 0700; directories elsewhere are checked, never changed.
+ * - The log's own directory belongs to this user, is not sticky, and nobody else can write to it.
+ *   A directory that fails is refused unchanged. Inside the home directory a directory that
+ *   passes is tightened to 0700 (others may still read it); directories elsewhere are never changed.
  * - The log is a regular file that belongs to this user (created when missing), with no ACL, and
  *   is set to 0600.
  */
@@ -68,11 +69,11 @@ export const PRIVATE_LOG_FN = [
   '    if [ -n "$pl_rest" ]; then safe_dir "$pl_d" parent || return 1; fi',
   '  done',
   '  [ -n "$pl_d" ] || { echo "serverLog must not be directly under /" >&2; return 1; }',
-  // The log directory: inside home it is made 0700 first (its parents were checked above), then checked.
-  '  if [ "$pl_h" != / ] && [ ! -L "$pl_d" ] && [ -d "$pl_d" ] && [ -O "$pl_d" ]; then',
-  '    case "$pl_d" in "$pl_h"/?*) pl_m=$((0x$(stat -c %f -- "$pl_d"))); if [ $((pl_m & 512)) -eq 0 ] && [ $((pl_m & 63)) -ne 0 ]; then chmod 700 "$pl_d" || return 1; fi;; esac',
-  '  fi',
+  // The log directory is checked as it is: one others can change is refused and left alone (it
+  // may be shared on purpose, and a descriptor opened while it was shared would outlive a chmod).
+  // Only a safe directory inside home is then tightened to 0700, which hides it from readers.
   '  safe_dir "$pl_d" leaf || return 1',
+  '  case "$pl_d" in "$pl_h"/?*) [ "$pl_h" = / ] || chmod 700 "$pl_d" || return 1;; esac',
   '  if [ -L "$L" ] || { [ -e "$L" ] && { [ ! -f "$L" ] || [ ! -O "$L" ]; }; }; then echo "$L must be a regular file that belongs to $(id -un)" >&2; return 1; fi',
   '  [ -e "$L" ] || (umask 077; : >> "$L") || return 1',
   '  chmod 600 "$L" || return 1',

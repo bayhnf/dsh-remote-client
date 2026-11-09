@@ -118,7 +118,7 @@ if (forward < 0) {
 }
 
 /** Boot a fresh main.js against fake servers. */
-async function boot({ hosts, sshHosts }) {
+async function boot({ hosts, sshHosts, before }) {
   const dir = await mkdtemp(join(tmpdir(), 'dshrc-main-'))
   const userData = join(dir, 'userData')
   await mkdir(userData, { recursive: true })
@@ -130,6 +130,7 @@ async function boot({ hosts, sshHosts }) {
   const ssh = await fakeSsh(dir)
   const fake = createFakeElectron({ userData })
   globalThis.__fakeElectron = fake.electron
+  await before?.(fake, userData)
   await import(`${pathToFileURL(join(APP, 'main.js')).href}?ssh=${encodeURIComponent(ssh)}&run=${Math.random()}`)
   fake.start()
   const until = async (condition, label, ms = 8000) => {
@@ -332,4 +333,33 @@ test('a forward that drops while the page loads is reconnected, not left dead', 
     const body = await fetch(`http://127.0.0.1:${t.ports[0]}/check`).then(r => r.text(), () => 'REFUSED')
     assert.equal(body, 'A', 'the window is served again')
   } finally { t.quit() }
+})
+
+test('Q6-3/N6-03: Remove retries a stale session whose startup clear failed, and keeps the host while it still fails', { timeout: 30000 }, async () => {
+  const webA = await fakeDshWeb('A')
+  const dir = await mkdtemp(join(tmpdir(), 'dshrc-main-pre-'))
+  const t = await boot({
+    hosts: [{ id: 'a', name: 'A', sshHost: 'host-a' }, { id: 'b', name: 'B', sshHost: 'host-b' }],
+    sshHosts: { 'host-a': { key: 'KEY_A', web: webA.port } },
+    before: async (fake, userData) => {
+      for (const name of ['dsh-remote-b-0123456789ab', 'dsh-remote-b']) await mkdir(join(userData, 'Partitions', name), { recursive: true })
+      // Startup's clear of the old-format session fails.
+      fake.electron.session.fromPartition('persist:dsh-remote-b-0123456789ab').failClear = true
+    },
+  })
+  try {
+    await t.until(() => t.appLoads(t.current()).length > 0, 'A page')
+    const legacy = t.fake.sessions.get('persist:dsh-remote-b-0123456789ab')
+    assert.equal(legacy.cleared, 0, 'the startup clear failed')
+    // Still failing: Remove refuses and keeps the host.
+    t.fake.dialogAnswers.push(0)
+    await assert.rejects(t.fake.invoke(t.current(), 'dsh-remote:remove', 'b'), /was not removed/u)
+    assert.deepEqual(JSON.parse(await readFile(join(t.userData, 'remote.json'), 'utf8')).hosts.map(host => host.id), ['a', 'b'])
+    // Storage recovers: Remove clears it now.
+    legacy.failClear = false
+    t.fake.dialogAnswers.push(0)
+    await t.fake.invoke(t.current(), 'dsh-remote:remove', 'b')
+    assert.equal(legacy.cleared, 1)
+    assert.deepEqual(JSON.parse(await readFile(join(t.userData, 'remote.json'), 'utf8')).hosts.map(host => host.id), ['a'])
+  } finally { t.quit(); void dir }
 })

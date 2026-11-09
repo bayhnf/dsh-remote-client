@@ -32,30 +32,95 @@ const SSH_OPTIONS = [
 const READY_TIMEOUT_MS = 20_000
 
 /**
- * A private record of the server one ssh process verified.
- * `options` are the ssh arguments that make ssh write it; `identity()` reads it back.
+ * The KnownHostsCommand ssh would run for `sshHost` from the user's own configuration, as `ssh -G`
+ * reports it (tokens unexpanded), or undefined when there is none.
+ * @param {string} sshHost - validated destination.
+ * @param {AbortSignal} [signal] - stop waiting.
+ * @returns {Promise<string | undefined>} the configured command line.
  */
-async function identityRecord() {
-  // ssh splits the KnownHostsCommand line on whitespace, so the record path must have none.
+function configuredKnownHostsCommand(sshHost, signal) {
+  return new Promise((resolve, reject) => {
+    execFile(SSH, ['-G', '--', sshHost], { timeout: 10_000, signal }, (error, stdout) => {
+      if (error) { reject(new Error(`ssh -G ${sshHost}: ${error.message}`)); return }
+      const line = String(stdout).split('\n').find(row => row.toLowerCase().startsWith('knownhostscommand '))
+      const value = line?.slice('knownhostscommand '.length).trim()
+      resolve(value === undefined || value === '' || value.toLowerCase() === 'none' ? undefined : value)
+    })
+  })
+}
+
+/**
+ * Split a KnownHostsCommand line the way ssh does before it expands tokens: on whitespace, with
+ * single or double quotes grouping (argv_split in OpenSSH misc.c).
+ * @param {string} text - command line.
+ * @returns {string[]} words.
+ */
+function splitCommand(text) {
+  const words = []
+  let word = ''
+  let quote = ''
+  let started = false
+  for (let index = 0; index < text.length; index++) {
+    const c = text[index]
+    if (quote === '' && /\s/u.test(c)) { if (started) { words.push(word); word = ''; started = false } continue }
+    started = true
+    if (c === '\\' && quote !== "'" && index + 1 < text.length && (text[index + 1] === '\\' || text[index + 1] === '"' || text[index + 1] === "'" || /\s/u.test(text[index + 1]))) { word += text[++index]; continue }
+    if (quote === '' && (c === '"' || c === "'")) { quote = c; continue }
+    if (c === quote) { quote = ''; continue }
+    word += c
+  }
+  if (started) words.push(word)
+  return words
+}
+
+/**
+ * A private record of the server one ssh process verified.
+ *
+ * ssh runs KnownHostsCommand for the final destination only (a ProxyJump or ProxyCommand host is
+ * another ssh process), and passes it that destination's user, host, port and the host key or
+ * certificate it is about to verify. The recorder writes those values, NUL-separated, to a
+ * private file, then runs the user's own KnownHostsCommand (from ~/.ssh/config) unchanged, so
+ * whatever it prints is still what ssh trusts; without one it prints nothing and ssh uses
+ * known_hosts as usual. Nothing the server sends can reach the record.
+ * `options` are the ssh arguments; `identity()` reads the record back.
+ * @param {string} sshHost - validated destination.
+ * @param {AbortSignal} [signal] - stop waiting.
+ */
+async function identityRecord(sshHost, signal) {
+  const configured = await configuredKnownHostsCommand(sshHost, signal)
+  // ssh splits this option on whitespace, so the record path must have none.
   const base = /^[A-Za-z0-9._/-]+$/u.test(tmpdir()) ? tmpdir() : '/tmp'
   const dir = await mkdtemp(join(base, 'dshrc-id-'))
   const file = join(dir, 'record')
-  // ssh expands %-tokens itself and runs the command without a shell; the arguments reach
-  // /bin/sh as positional parameters, so no value is parsed as shell text. The script prints
-  // nothing (host keys come from known_hosts) and exits 0, so it never changes what ssh accepts.
-  // `%%` is ssh's escape for a literal `%`.
-  const script = 'f=$1; shift; [ "$1" = HOSTNAME ] && [ "$5" != NONE ] && printf "%%s\\n" "$*" >> "$f"; exit 0'
+  const count = 7
+  // $1 record file, $2.. %I %r %h %p %t %f %K, then the user's command words (already expanded by
+  // ssh). Only a HOSTNAME lookup with a key is recorded; ssh may also look up by ADDRESS
+  // (CheckHostIP) or for algorithm ORDER without a key.
+  const script = [
+    'f=$1; shift',
+    // No single quotes inside: the whole script travels in one single-quoted ssh word.
+    'if [ "$1" = HOSTNAME ] && [ "$5" != NONE ]; then printf "%%s\\0" "$2" "$3" "$4" "$5" "$7" >> "$f" || exit 1; printf "\\n" >> "$f" || exit 1; fi',
+    `shift ${count}`,
+    'if [ $# -gt 0 ]; then exec "$@"; fi',
+    'exit 0',
+  ].join('; ')
+  if (script.includes("'")) throw new Error('identity recorder script must not contain single quotes')
+  // The user's command is passed as separate, quoted words: a word ssh would split is quoted here
+  // so it reaches the shell as one argument after ssh expands its tokens.
+  const quote = word => `"${word.replace(/[\\"]/gu, c => `\\${c}`)}"`
+  const userWords = configured === undefined ? [] : splitCommand(configured).map(quote)
   return {
-    options: ['-o', `KnownHostsCommand=/bin/sh -c '${script}' dshrc ${file} %I %r %h %p %t %f %K`],
-    /** @returns {Promise<string>} digest of user@host:port + key, or '' when ssh verified none. */
+    options: ['-o', `KnownHostsCommand=/bin/sh -c '${script}' dshrc ${file} %I %r %h %p %t %f %K ${userWords.join(' ')}`.trimEnd()],
+    /** @returns {Promise<string>} digest of the final destination and its key, or '' when ssh verified none. */
     async identity() {
       const text = await readFile(file, 'utf8').catch(() => '')
-      const lines = [...new Set(text.split('\n').filter(Boolean))]
+      const records = [...new Set(text.split('\n').filter(Boolean))]
       // One lookup by name per connection; more than one distinct target is never trusted.
-      if (lines.length !== 1) return ''
-      const [, user, host, port, keyType, , key] = lines[0].split(' ')
-      if (!user || !host || !port || !keyType || !key) return ''
-      return createHash('sha256').update(`${user}@${host}:${port}|${keyType} ${key}`).digest('hex')
+      if (records.length !== 1) return ''
+      const fields = records[0].split('\0')
+      // Five values, each followed by NUL: exactly six parts with an empty last one.
+      if (fields.length !== 6 || fields[5] !== '' || fields.slice(0, 5).some(value => value === '')) return ''
+      return createHash('sha256').update(JSON.stringify(fields.slice(0, 5))).digest('hex')
     },
     dispose: () => rm(dir, { recursive: true, force: true }).catch(() => undefined),
   }
@@ -80,7 +145,7 @@ class SshOutput {
  *   that ran it; rejects with ssh's message on failure.
  */
 export async function sshRun(sshHost, script, { timeoutMs = 90_000, signal } = {}) {
-  const record = await identityRecord()
+  const record = await identityRecord(sshHost, signal)
   try {
     const out = await new Promise((resolve, reject) => {
       // The script travels on stdin, so its size is not bound by the remote argv limit. It is
@@ -133,16 +198,20 @@ export class LoopbackProxy {
       upstream.on('error', done).on('close', done)
       client.pipe(upstream).pipe(client)
     })
+    const server = this.server
     this.ready = new Promise((resolve, reject) => {
-      this.server.once('error', (error) => {
-        this.server = undefined
+      const failed = (error) => {
+        if (this.server === server) this.server = undefined
         reject(error.code === 'EADDRINUSE'
           ? new Error(`port 127.0.0.1:${this.port} is in use by another program; quit it or change localPort in remote.json`)
           : error)
-      })
-      this.server.listen(this.port, '127.0.0.1', () => {
-        // Once bound, an accept error (such as EMFILE) concerns one connection; the port stays held.
-        this.server?.on('error', () => {})
+      }
+      server.once('error', failed)
+      server.listen(this.port, '127.0.0.1', () => {
+        // Once bound, an accept error (such as EMFILE) concerns one connection: the server and
+        // the port stay held, and close() still releases them.
+        server.off('error', failed)
+        server.on('error', () => {})
         resolve()
       })
     })
@@ -212,7 +281,7 @@ export class Tunnel {
     await this.proxy.listen()
     if (this.stopping) throw stoppedError()
     await rm(this.socketPath, { force: true })
-    this.record = await identityRecord()
+    this.record = await identityRecord(this.sshHost)
     if (this.stopping) { await this.record.dispose(); throw stoppedError() }
     const forward = `${this.socketPath}:${this.target.host}:${this.target.port}`
     const child = spawn(this.ssh, [...SSH_OPTIONS, ...this.record.options, '-o', 'ExitOnForwardFailure=yes', '-o', 'StreamLocalBindUnlink=yes',

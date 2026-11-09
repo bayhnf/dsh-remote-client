@@ -416,36 +416,39 @@ async function confirmNative(message, detail, action) {
   return response === 0
 }
 
+/** Clear one persistent session's cookies, storage and cache. */
+async function clearPartition(name) {
+  const ses = session.fromPartition(`persist:${name}`)
+  await ses.clearStorageData()
+  await ses.clearCache()
+}
+
 /**
- * Clear every session that belongs to a host id: each server it ever reached, from any run, and
- * the names earlier versions used.
+ * Clear every session a removed host could have used: its own (each server it ever reached, from
+ * any run) and every session no configured host owns (old names from earlier versions, hosts
+ * removed before), so a clear that failed at startup is retried here. Any failure rejects.
+ * Other configured hosts' sessions are never touched.
  */
 async function clearHostSessions(hostId) {
-  const names = new Set((await partitionDirs(app.getPath('userData'))).filter(name => belongsTo(hostId, name)))
+  const names = await partitionDirs(app.getPath('userData'))
+  const remaining = config.hosts.map(host => host.id).filter(id => id !== hostId)
+  const targets = new Set([...names.filter(name => belongsTo(hostId, name)), ...staleNames(names, remaining)])
   const known = knownSessions.get(hostId)
-  if (known !== undefined) names.add(known.slice('persist:'.length))
-  for (const name of names) {
-    const ses = session.fromPartition(`persist:${name}`)
-    await ses.clearStorageData()
-    await ses.clearCache()
-  }
+  if (known !== undefined) targets.add(known.slice('persist:'.length))
+  for (const name of targets) await clearPartition(name)
 }
 
 /**
  * At startup, clear sessions no configured host can use: those named by earlier versions (keyed by
  * the alias, not the verified server) and those of hosts removed outside the app. A failure is
- * logged; such a session is never loaded, because current names include the verified identity.
+ * logged and retried by the next Remove; such a session is never loaded, because current names
+ * include the verified identity.
  */
 async function clearStaleSessions() {
   let names
   try { names = await partitionDirs(app.getPath('userData')) } catch (error) { log(`listing saved sessions failed: ${error.message}`); return }
-  const stale = staleNames(names, config.hosts.map(host => host.id))
-  for (const name of stale) {
-    try {
-      const ses = session.fromPartition(`persist:${name}`)
-      await ses.clearStorageData()
-      await ses.clearCache()
-    } catch (error) { log(`clearing old session ${name} failed: ${error.message}`) }
+  for (const name of staleNames(names, config.hosts.map(host => host.id))) {
+    try { await clearPartition(name) } catch (error) { log(`clearing old session ${name} failed: ${error.message}`) }
   }
 }
 
