@@ -11,7 +11,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import { RemoteServersSection } from './RemoteServersSection.tsx'
 import { dictionaries, type RemoteServersKey } from './locales.ts'
-import type { RemoteBridge } from './bridge.ts'
+import type { RemoteBridge, RemoteServersActions } from './bridge.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap { 'settings.remoteServers': RemoteServersKey }
@@ -30,12 +30,22 @@ export function apply(ctx: Context): void {
   ctx.effect(() => ctx.locale.register('settings.remoteServers', dictionaries), 'remote servers: dictionaries')
   const t = ctx.locale.bind('settings.remoteServers')
   const bridge = (globalThis as { dshRemote?: RemoteBridge }).dshRemote
+  // Components receive plain callbacks; the bridge object itself stays in this apply closure.
+  const actions: RemoteServersActions | undefined = bridge === undefined ? undefined : {
+    list: () => bridge.list(),
+    add: draft => bridge.add(draft),
+    remove: id => bridge.remove(id),
+    probe: id => bridge.probe(id),
+    setup: id => bridge.setup(id),
+    switchTo: id => bridge.switchTo(id),
+    pickSshAlias: () => bridge.pickSshAlias(),
+  }
   ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section',
     id: 'remote-servers',
     order: 15,
     label: () => t('nav'),
     locale: 'settings.remoteServers',
-    inject: () => ({ bridge }),
+    inject: () => ({ managed: actions !== undefined, actions }),
   }, RemoteServersSection)), 'remote servers: settings page')
 }

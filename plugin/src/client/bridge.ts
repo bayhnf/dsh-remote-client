@@ -36,6 +36,9 @@ export interface RemoteHostDraft {
   readonly sshHost: string
 }
 
+/** Per-action callbacks the page receives through its inject face. */
+export type RemoteServersActions = Omit<RemoteBridge, 'version'>
+
 /** Operations implemented by the desktop client's main process. */
 export interface RemoteBridge {
   readonly version: 1
@@ -45,5 +48,6 @@ export interface RemoteBridge {
   probe(id: string): Promise<RemoteProbe>
   setup(id: string): Promise<{ readonly output: string }>
   switchTo(id: string): Promise<void>
-  sshConfigHosts(): Promise<readonly string[]>
+  /** Shows a native menu of ~/.ssh/config aliases; resolves to the chosen alias or null. */
+  pickSshAlias(): Promise<string | null>
 }

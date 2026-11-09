@@ -9,7 +9,6 @@ const en = {
   check: 'Check',
   setup: 'Set up server',
   remove: 'Remove',
-  removeConfirm: 'Remove {name} from this list? Nothing on the server is deleted.',
   addTitle: 'Add a server',
   addHint: 'Use an alias from ~/.ssh/config or user@host. The server needs key-based SSH and Node.js 22.19+.',
   name: 'Name',
@@ -26,6 +25,10 @@ const en = {
   yes: 'yes',
   no: 'no',
   sshAliases: 'From ~/.ssh/config',
+  sshHostPlaceholder: 'my-server, user@host',
+  retry: 'Retry',
+  loading: 'Loading servers…',
+  namePlaceholder: 'My server',
 } as const
 
 /** Message keys. */
@@ -40,7 +43,6 @@ const id: Record<RemoteServersKey, string> = {
   check: 'Cek',
   setup: 'Siapkan server',
   remove: 'Hapus',
-  removeConfirm: 'Hapus {name} dari daftar? Tidak ada yang dihapus di server.',
   addTitle: 'Tambah server',
   addHint: 'Pakai alias dari ~/.ssh/config atau user@host. Server butuh SSH berbasis key dan Node.js 22.19+.',
   name: 'Nama',
@@ -57,6 +59,10 @@ const id: Record<RemoteServersKey, string> = {
   yes: 'ya',
   no: 'tidak',
   sshAliases: 'Dari ~/.ssh/config',
+  sshHostPlaceholder: 'server-saya, user@host',
+  retry: 'Coba lagi',
+  loading: 'Memuat server…',
+  namePlaceholder: 'Server saya',
 }
 
 const zh: Record<RemoteServersKey, string> = {
@@ -68,7 +74,6 @@ const zh: Record<RemoteServersKey, string> = {
   check: '检查',
   setup: '配置服务器',
   remove: '移除',
-  removeConfirm: '从列表中移除 {name}？服务器上的内容不会被删除。',
   addTitle: '添加服务器',
   addHint: '使用 ~/.ssh/config 中的别名或 user@host。服务器需要基于密钥的 SSH 和 Node.js 22.19+。',
   name: '名称',
@@ -85,6 +90,10 @@ const zh: Record<RemoteServersKey, string> = {
   yes: '是',
   no: '否',
   sshAliases: '来自 ~/.ssh/config',
+  sshHostPlaceholder: 'my-server、user@host',
+  retry: '重试',
+  loading: '正在加载服务器…',
+  namePlaceholder: '我的服务器',
 }
 
 /** Dictionaries keyed by locale id. */

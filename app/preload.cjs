@@ -79,7 +79,7 @@ if (trusted) {
     probe: id => ipcRenderer.invoke(IPC.remoteProbe, id),
     setup: id => ipcRenderer.invoke(IPC.remoteSetup, id),
     switchTo: id => ipcRenderer.invoke(IPC.remoteSwitch, id),
-    sshConfigHosts: () => ipcRenderer.invoke(IPC.remoteSshAliases),
+    pickSshAlias: () => ipcRenderer.invoke(IPC.remoteSshAliases),
   })
 
   contextBridge.exposeInMainWorld('dshOnboarding', {

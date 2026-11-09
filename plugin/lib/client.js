@@ -35,27 +35,28 @@ window.__ModuleLoader__.load({
 		var import_dsh_client_ui_primitives = require("@deepseek-ai/dsh-client-ui-primitives");
 		
 		// src/client/RemoteServersSection.module.css
-		var css = "/* Layout follows the official settings rows: 14/20 titles, 12/18 secondary copy, l2 hairlines. */\n\n.rs_page_ac24f9 {\n  display: flex;\n  flex-direction: column;\n  width: 100%;\n}\n\n.rs_header_ac24f9 {\n  padding-bottom: 16px;\n  border-bottom: 0.5px solid var(--dsw-alias-border-l2);\n}\n\n.rs_title_ac24f9 {\n  margin: 0;\n  color: var(--dsw-alias-label-primary);\n  font-size: 16px;\n  font-weight: 600;\n  line-height: 24px;\n}\n\n.rs_description_ac24f9,\n.rs_notice_ac24f9 {\n  margin: 4px 0 0;\n  color: var(--dsw-alias-label-secondary);\n  font-size: 12px;\n  line-height: 18px;\n}\n\n.rs_notice_ac24f9 {\n  padding: 16px 0;\n}\n\n.rs_list_ac24f9 {\n  margin: 0;\n  padding: 0;\n  list-style: none;\n}\n\n.rs_row_ac24f9 {\n  display: flex;\n  align-items: flex-start;\n  justify-content: space-between;\n  gap: 24px;\n  padding: 16px 0;\n  border-bottom: 0.5px solid var(--dsw-alias-border-l2);\n}\n\n.rs_row_ac24f9[data-active] .rs_name_ac24f9 {\n  font-weight: 600;\n}\n\n.rs_identity_ac24f9 {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  min-width: 0;\n}\n\n.rs_nameLine_ac24f9 {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n}\n\n.rs_name_ac24f9 {\n  color: var(--dsw-alias-label-primary);\n  font-size: 14px;\n  line-height: 20px;\n}\n\n.rs_meta_ac24f9 {\n  overflow: hidden;\n  color: var(--dsw-alias-label-tertiary);\n  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;\n  font-size: 12px;\n  line-height: 18px;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n.rs_progress_ac24f9 {\n  color: var(--dsw-alias-label-secondary);\n  font-size: 12px;\n  line-height: 18px;\n}\n\n.rs_success_ac24f9 {\n  color: var(--dsw-alias-state-success-primary);\n  font-size: 12px;\n  line-height: 18px;\n}\n\n.rs_error_ac24f9 {\n  color: var(--dsw-alias-state-error-primary, #e5484d);\n  font-size: 12px;\n  line-height: 18px;\n  white-space: pre-wrap;\n}\n\n.rs_actions_ac24f9 {\n  display: flex;\n  flex-shrink: 0;\n  align-items: center;\n  gap: 8px;\n}\n\n.rs_add_ac24f9 {\n  padding: 20px 0 8px;\n}\n\n.rs_addTitle_ac24f9 {\n  margin: 0;\n  color: var(--dsw-alias-label-primary);\n  font-size: 14px;\n  font-weight: 600;\n  line-height: 20px;\n}\n\n.rs_fields_ac24f9 {\n  display: grid;\n  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;\n  align-items: end;\n  gap: 12px;\n  margin-top: 12px;\n}\n\n.rs_field_ac24f9 {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n\n.rs_label_ac24f9 {\n  color: var(--dsw-alias-label-secondary);\n  font-size: 12px;\n  line-height: 18px;\n}\n";
+		var css = "/* Layout follows the official settings rows: 14/20 titles, 12/18 secondary copy, l2 hairlines. */\n\n.rs_page_ac24f9 {\n  display: flex;\n  flex-direction: column;\n  width: 100%;\n}\n\n.rs_header_ac24f9 {\n  padding-bottom: 16px;\n  border-bottom: 0.5px solid var(--dsw-alias-border-l2);\n}\n\n.rs_title_ac24f9 {\n  margin: 0;\n  color: var(--dsw-alias-label-primary);\n  font-size: 16px;\n  font-weight: 500;\n  line-height: 24px;\n}\n\n.rs_description_ac24f9,\n.rs_notice_ac24f9 {\n  margin: 4px 0 0;\n  color: var(--dsw-alias-label-secondary);\n  font-size: 12px;\n  line-height: 18px;\n}\n\n.rs_notice_ac24f9 {\n  padding: 16px 0;\n}\n\n.rs_list_ac24f9 {\n  margin: 0;\n  padding: 0;\n  list-style: none;\n}\n\n.rs_row_ac24f9 {\n  display: flex;\n  align-items: flex-start;\n  justify-content: space-between;\n  gap: 24px;\n  padding: 16px 0;\n  border-bottom: 0.5px solid var(--dsw-alias-border-l2);\n}\n\n.rs_row_ac24f9[data-active] .rs_name_ac24f9 {\n  font-weight: 500;\n}\n\n.rs_identity_ac24f9 {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  min-width: 0;\n}\n\n.rs_nameLine_ac24f9 {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n}\n\n.rs_name_ac24f9 {\n  color: var(--dsw-alias-label-primary);\n  font-size: 14px;\n  line-height: 20px;\n}\n\n.rs_meta_ac24f9 {\n  overflow: hidden;\n  color: var(--dsw-alias-label-tertiary);\n  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;\n  font-size: 12px;\n  line-height: 18px;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n.rs_progress_ac24f9 {\n  color: var(--dsw-alias-label-secondary);\n  font-size: 12px;\n  line-height: 18px;\n}\n\n.rs_success_ac24f9 {\n  color: var(--dsw-alias-state-success-primary);\n  font-size: 12px;\n  line-height: 18px;\n}\n\n.rs_error_ac24f9 {\n  color: var(--dsw-alias-state-error-primary);\n  font-size: 12px;\n  line-height: 18px;\n  white-space: pre-wrap;\n}\n\n.rs_actions_ac24f9 {\n  display: flex;\n  flex-shrink: 0;\n  align-items: center;\n  gap: 8px;\n}\n\n.rs_add_ac24f9 {\n  padding: 20px 0 8px;\n}\n\n.rs_addTitle_ac24f9 {\n  margin: 0;\n  color: var(--dsw-alias-label-primary);\n  font-size: 14px;\n  font-weight: 500;\n  line-height: 20px;\n}\n\n.rs_fields_ac24f9 {\n  display: grid;\n  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;\n  align-items: end;\n  gap: 12px;\n  margin-top: 12px;\n}\n\n.rs_field_ac24f9 {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n\n.rs_inputRow_ac24f9 {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n}\n\n.rs_label_ac24f9 {\n  color: var(--dsw-alias-label-secondary);\n  font-size: 12px;\n  line-height: 18px;\n}\n";
 		if (typeof document !== "undefined" && !document.querySelector('style[data-dsh-remote-servers="ac24f9"]')) {
 		  const tag = document.createElement("style");
 		  tag.dataset.dshRemoteServers = "ac24f9";
 		  tag.textContent = css;
 		  document.head.appendChild(tag);
 		}
-		var RemoteServersSection_default = { "page": "rs_page_ac24f9", "header": "rs_header_ac24f9", "title": "rs_title_ac24f9", "description": "rs_description_ac24f9", "notice": "rs_notice_ac24f9", "list": "rs_list_ac24f9", "row": "rs_row_ac24f9", "name": "rs_name_ac24f9", "identity": "rs_identity_ac24f9", "nameLine": "rs_nameLine_ac24f9", "meta": "rs_meta_ac24f9", "progress": "rs_progress_ac24f9", "success": "rs_success_ac24f9", "error": "rs_error_ac24f9", "actions": "rs_actions_ac24f9", "add": "rs_add_ac24f9", "addTitle": "rs_addTitle_ac24f9", "fields": "rs_fields_ac24f9", "field": "rs_field_ac24f9", "label": "rs_label_ac24f9" };
+		var RemoteServersSection_default = { "page": "rs_page_ac24f9", "header": "rs_header_ac24f9", "title": "rs_title_ac24f9", "description": "rs_description_ac24f9", "notice": "rs_notice_ac24f9", "list": "rs_list_ac24f9", "row": "rs_row_ac24f9", "name": "rs_name_ac24f9", "identity": "rs_identity_ac24f9", "nameLine": "rs_nameLine_ac24f9", "meta": "rs_meta_ac24f9", "progress": "rs_progress_ac24f9", "success": "rs_success_ac24f9", "error": "rs_error_ac24f9", "actions": "rs_actions_ac24f9", "add": "rs_add_ac24f9", "addTitle": "rs_addTitle_ac24f9", "fields": "rs_fields_ac24f9", "field": "rs_field_ac24f9", "inputRow": "rs_inputRow_ac24f9", "label": "rs_label_ac24f9" };
 		
 		// src/client/RemoteServersSection.tsx
 		var import_jsx_runtime = require("react/jsx-runtime");
 		var IDLE = { kind: "idle" };
 		var message = (error) => error instanceof Error ? error.message : String(error);
-		function RemoteServersSection({ bridge, t }) {
-		  if (bridge === void 0) {
+		var cancelled = (error) => /\bcancelled$/u.test(message(error));
+		function RemoteServersSection({ managed, actions, t }) {
+		  if (!managed || actions === void 0) {
 		    return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: RemoteServersSection_default.page, children: [
 		      /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Header, { t }),
 		      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: RemoteServersSection_default.notice, children: t("browserOnly") })
 		    ] });
 		  }
-		  return /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ManagedServers, { bridge, t });
+		  return /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ManagedServers, { actions, t });
 		}
 		function Header({ t }) {
 		  return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("header", { className: RemoteServersSection_default.header, children: [
@@ -63,9 +64,10 @@ window.__ModuleLoader__.load({
 		    /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: RemoteServersSection_default.description, children: t("description") })
 		  ] });
 		}
-		function ManagedServers({ bridge, t }) {
+		function ManagedServers({ actions: bridge, t }) {
 		  const [config, setConfig] = (0, import_react.useState)(void 0);
 		  const [loadError, setLoadError] = (0, import_react.useState)(void 0);
+		  const [loadAttempt, setLoadAttempt] = (0, import_react.useState)(0);
 		  const [status, setStatus] = (0, import_react.useState)({});
 		  const setHostStatus = (id2, next) => {
 		    setStatus((current) => ({ ...current, [id2]: next }));
@@ -75,12 +77,15 @@ window.__ModuleLoader__.load({
 		    try {
 		      const report = await bridge.probe(id2);
 		      setStatus((current) => ({ ...current, [id2]: { kind: "probe", probe: report } }));
+		      return report;
 		    } catch (error) {
 		      setStatus((current) => ({ ...current, [id2]: { kind: "error", text: t("failed", { message: message(error) }) } }));
+		      return void 0;
 		    }
 		  }, [bridge, t]);
 		  (0, import_react.useEffect)(() => {
 		    let live = true;
+		    setLoadError(void 0);
 		    bridge.list().then((value) => {
 		      if (!live) return;
 		      setConfig(value);
@@ -91,7 +96,7 @@ window.__ModuleLoader__.load({
 		    return () => {
 		      live = false;
 		    };
-		  }, [bridge, probe]);
+		  }, [bridge, probe, loadAttempt]);
 		  const run = async (id2, busyText, action, doneText) => {
 		    setHostStatus(id2, { kind: "busy", text: busyText });
 		    try {
@@ -100,14 +105,22 @@ window.__ModuleLoader__.load({
 		      if (doneText !== void 0) setHostStatus(id2, { kind: "done", text: doneText });
 		      else setHostStatus(id2, IDLE);
 		    } catch (error) {
-		      setHostStatus(id2, { kind: "error", text: t("failed", { message: message(error) }) });
+		      setHostStatus(id2, cancelled(error) ? IDLE : { kind: "error", text: t("failed", { message: message(error) }) });
 		    }
 		  };
-		  if (loadError !== void 0) return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: RemoteServersSection_default.page, children: [
+		  if (loadError !== void 0) {
+		    return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: RemoteServersSection_default.page, children: [
+		      /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Header, { t }),
+		      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { role: "alert", className: RemoteServersSection_default.error, children: t("failed", { message: loadError }) }),
+		      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(import_dsh_client_ui_primitives.Button, { variant: "outline", size: "sm", onClick: () => {
+		        setLoadAttempt((n) => n + 1);
+		      }, children: t("retry") }) })
+		    ] });
+		  }
+		  if (config === void 0) return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: RemoteServersSection_default.page, "aria-busy": "true", children: [
 		    /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Header, { t }),
-		    /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { role: "alert", className: RemoteServersSection_default.error, children: t("failed", { message: loadError }) })
+		    /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: RemoteServersSection_default.notice, children: t("loading") })
 		  ] });
-		  if (config === void 0) return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("section", { className: RemoteServersSection_default.page, children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Header, { t }) });
 		  return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: RemoteServersSection_default.page, children: [
 		    /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Header, { t }),
 		    /* @__PURE__ */ (0, import_jsx_runtime.jsx)("ul", { className: RemoteServersSection_default.list, children: config.hosts.map((host) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
@@ -121,18 +134,20 @@ window.__ModuleLoader__.load({
 		          void probe(host.id);
 		        },
 		        onSetup: () => {
-		          void run(host.id, t("settingUp"), async () => {
-		            await bridge.setup(host.id);
-		            await probe(host.id);
-		          }, t("setupDone"));
+		          setHostStatus(host.id, { kind: "busy", text: t("settingUp") });
+		          bridge.setup(host.id).then(async () => {
+		            const report = await probe(host.id);
+		            if (report?.ready === true) setHostStatus(host.id, { kind: "done", text: t("setupDone") });
+		          }, (error) => {
+		            setHostStatus(host.id, cancelled(error) ? IDLE : { kind: "error", text: t("failed", { message: message(error) }) });
+		          });
 		        },
 		        onSwitch: () => {
 		          void run(host.id, t("checking"), () => bridge.switchTo(host.id));
 		        },
 		        onRemove: () => {
-		          if (!window.confirm(t("removeConfirm", { name: host.name }))) return;
 		          void bridge.remove(host.id).then(setConfig, (error) => {
-		            setHostStatus(host.id, { kind: "error", text: t("failed", { message: message(error) }) });
+		            if (!cancelled(error)) setHostStatus(host.id, { kind: "error", text: t("failed", { message: message(error) }) });
 		          });
 		        }
 		      },
@@ -182,19 +197,14 @@ window.__ModuleLoader__.load({
 		function AddServer({ bridge, t, onAdded }) {
 		  const [name2, setName] = (0, import_react.useState)("");
 		  const [sshHost, setSshHost] = (0, import_react.useState)("");
-		  const [aliases, setAliases] = (0, import_react.useState)([]);
 		  const [busy, setBusy] = (0, import_react.useState)(false);
 		  const [error, setError] = (0, import_react.useState)(void 0);
-		  (0, import_react.useEffect)(() => {
-		    let live = true;
-		    bridge.sshConfigHosts().then((value) => {
-		      if (live) setAliases(value);
+		  const pickAlias = () => {
+		    bridge.pickSshAlias().then((alias) => {
+		      if (alias !== null) setSshHost(alias);
 		    }, () => {
 		    });
-		    return () => {
-		      live = false;
-		    };
-		  }, [bridge]);
+		  };
 		  const submit = (event) => {
 		    event.preventDefault();
 		    if (sshHost.trim() === "") return;
@@ -205,7 +215,7 @@ window.__ModuleLoader__.load({
 		      setSshHost("");
 		      onAdded(next);
 		    }, (failure) => {
-		      setError(t("failed", { message: message(failure) }));
+		      if (!cancelled(failure)) setError(t("failed", { message: message(failure) }));
 		    }).finally(() => {
 		      setBusy(false);
 		    });
@@ -216,24 +226,25 @@ window.__ModuleLoader__.load({
 		    /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: RemoteServersSection_default.fields, children: [
 		      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("label", { className: RemoteServersSection_default.field, children: [
 		        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: RemoteServersSection_default.label, children: t("sshHost") }),
-		        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
-		          import_dsh_client_ui_primitives.Input,
-		          {
-		            value: sshHost,
-		            list: "dsh-remote-ssh-aliases",
-		            placeholder: "my-server, user@host",
-		            autoComplete: "off",
-		            spellCheck: false,
-		            onChange: (event) => {
-		              setSshHost(event.currentTarget.value);
+		        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { className: RemoteServersSection_default.inputRow, children: [
+		          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
+		            import_dsh_client_ui_primitives.Input,
+		            {
+		              value: sshHost,
+		              placeholder: t("sshHostPlaceholder"),
+		              autoComplete: "off",
+		              spellCheck: false,
+		              onChange: (event) => {
+		                setSshHost(event.currentTarget.value);
+		              }
 		            }
-		          }
-		        ),
-		        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("datalist", { id: "dsh-remote-ssh-aliases", children: aliases.map((alias) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", { value: alias }, alias)) })
+		          ),
+		          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(import_dsh_client_ui_primitives.Button, { type: "button", variant: "ghost", size: "sm", onClick: pickAlias, children: t("sshAliases") })
+		        ] })
 		      ] }),
 		      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("label", { className: RemoteServersSection_default.field, children: [
 		        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: RemoteServersSection_default.label, children: t("name") }),
-		        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(import_dsh_client_ui_primitives.Input, { value: name2, placeholder: sshHost || "My server", autoComplete: "off", onChange: (event) => {
+		        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(import_dsh_client_ui_primitives.Input, { value: name2, placeholder: sshHost || t("namePlaceholder"), autoComplete: "off", onChange: (event) => {
 		          setName(event.currentTarget.value);
 		        } })
 		      ] }),
@@ -253,7 +264,6 @@ window.__ModuleLoader__.load({
 		  check: "Check",
 		  setup: "Set up server",
 		  remove: "Remove",
-		  removeConfirm: "Remove {name} from this list? Nothing on the server is deleted.",
 		  addTitle: "Add a server",
 		  addHint: "Use an alias from ~/.ssh/config or user@host. The server needs key-based SSH and Node.js 22.19+.",
 		  name: "Name",
@@ -269,7 +279,11 @@ window.__ModuleLoader__.load({
 		  details: "dsh {dsh} \xB7 Node {node} \xB7 service {unit} \xB7 dsh-tui {tui} \xB7 page {page}",
 		  yes: "yes",
 		  no: "no",
-		  sshAliases: "From ~/.ssh/config"
+		  sshAliases: "From ~/.ssh/config",
+		  sshHostPlaceholder: "my-server, user@host",
+		  retry: "Retry",
+		  loading: "Loading servers\u2026",
+		  namePlaceholder: "My server"
 		};
 		var id = {
 		  nav: "Server remote",
@@ -280,7 +294,6 @@ window.__ModuleLoader__.load({
 		  check: "Cek",
 		  setup: "Siapkan server",
 		  remove: "Hapus",
-		  removeConfirm: "Hapus {name} dari daftar? Tidak ada yang dihapus di server.",
 		  addTitle: "Tambah server",
 		  addHint: "Pakai alias dari ~/.ssh/config atau user@host. Server butuh SSH berbasis key dan Node.js 22.19+.",
 		  name: "Nama",
@@ -296,7 +309,11 @@ window.__ModuleLoader__.load({
 		  details: "dsh {dsh} \xB7 Node {node} \xB7 service {unit} \xB7 dsh-tui {tui} \xB7 page {page}",
 		  yes: "ya",
 		  no: "tidak",
-		  sshAliases: "Dari ~/.ssh/config"
+		  sshAliases: "Dari ~/.ssh/config",
+		  sshHostPlaceholder: "server-saya, user@host",
+		  retry: "Coba lagi",
+		  loading: "Memuat server\u2026",
+		  namePlaceholder: "Server saya"
 		};
 		var zh = {
 		  nav: "\u8FDC\u7A0B\u670D\u52A1\u5668",
@@ -307,7 +324,6 @@ window.__ModuleLoader__.load({
 		  check: "\u68C0\u67E5",
 		  setup: "\u914D\u7F6E\u670D\u52A1\u5668",
 		  remove: "\u79FB\u9664",
-		  removeConfirm: "\u4ECE\u5217\u8868\u4E2D\u79FB\u9664 {name}\uFF1F\u670D\u52A1\u5668\u4E0A\u7684\u5185\u5BB9\u4E0D\u4F1A\u88AB\u5220\u9664\u3002",
 		  addTitle: "\u6DFB\u52A0\u670D\u52A1\u5668",
 		  addHint: "\u4F7F\u7528 ~/.ssh/config \u4E2D\u7684\u522B\u540D\u6216 user@host\u3002\u670D\u52A1\u5668\u9700\u8981\u57FA\u4E8E\u5BC6\u94A5\u7684 SSH \u548C Node.js 22.19+\u3002",
 		  name: "\u540D\u79F0",
@@ -323,7 +339,11 @@ window.__ModuleLoader__.load({
 		  details: "dsh {dsh} \xB7 Node {node} \xB7 \u670D\u52A1 {unit} \xB7 dsh-tui {tui} \xB7 \u9875\u9762 {page}",
 		  yes: "\u662F",
 		  no: "\u5426",
-		  sshAliases: "\u6765\u81EA ~/.ssh/config"
+		  sshAliases: "\u6765\u81EA ~/.ssh/config",
+		  sshHostPlaceholder: "my-server\u3001user@host",
+		  retry: "\u91CD\u8BD5",
+		  loading: "\u6B63\u5728\u52A0\u8F7D\u670D\u52A1\u5668\u2026",
+		  namePlaceholder: "\u6211\u7684\u670D\u52A1\u5668"
 		};
 		var dictionaries = { en, id, zh };
 		
@@ -334,13 +354,22 @@ window.__ModuleLoader__.load({
 		  ctx.effect(() => ctx.locale.register("settings.remoteServers", dictionaries), "remote servers: dictionaries");
 		  const t = ctx.locale.bind("settings.remoteServers");
 		  const bridge = globalThis.dshRemote;
+		  const actions = bridge === void 0 ? void 0 : {
+		    list: () => bridge.list(),
+		    add: (draft) => bridge.add(draft),
+		    remove: (id2) => bridge.remove(id2),
+		    probe: (id2) => bridge.probe(id2),
+		    setup: (id2) => bridge.setup(id2),
+		    switchTo: (id2) => bridge.switchTo(id2),
+		    pickSshAlias: () => bridge.pickSshAlias()
+		  };
 		  ctx.effect(() => ctx.slots.inject("settings.section", () => ctx.slots.register({
 		    name: "settings.section",
 		    id: "remote-servers",
 		    order: 15,
 		    label: () => t("nav"),
 		    locale: "settings.remoteServers",
-		    inject: () => ({ bridge })
+		    inject: () => ({ managed: actions !== void 0, actions })
 		  }, RemoteServersSection)), "remote servers: settings page");
 		}
 		

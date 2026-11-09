@@ -6,12 +6,12 @@
  * same split Orca uses between `orca serve` and its desktop client. The window, preload
  * bridges and keyboard handling mirror the official app so the UI renders its Desktop layout.
  */
-import { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, shell, session } from 'electron'
+import { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, shell, session, systemPreferences } from 'electron'
 import { join } from 'node:path'
-import { appendFile, readFile } from 'node:fs/promises'
+import { appendFile, chmod, readFile } from 'node:fs/promises'
 import { cpus, totalmem } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { loadConfig, saveConfig, slug, nextLocalPort, HOST_DEFAULTS } from './lib/config.js'
+import { loadConfig, updateConfig, slug, nextLocalPort, HOST_DEFAULTS } from './lib/config.js'
 import { launchScript, parseLaunchUrl, localLaunchUrl, redact } from './lib/launch.js'
 import { Tunnel, runRemote } from './lib/tunnel.js'
 import { authenticate, hostRpc, hasConfiguredApiKey } from './lib/host-rpc.js'
@@ -48,6 +48,8 @@ let mainWindow
 let shortcuts
 let invokeHost
 let stopAccountWatch
+/** Bumped by every openApp(); an older in-flight connect sees the change and stops. */
+let connectGeneration = 0
 let quitting = false
 let reconnecting = false
 
@@ -55,7 +57,7 @@ function logFile() { return join(app.getPath('userData'), 'remote.log') }
 function configFile() { return join(app.getPath('userData'), 'remote.json') }
 function log(message) {
   const line = `${new Date().toISOString()} ${redact(message)}\n`
-  void appendFile(logFile(), line).catch(() => undefined)
+  void appendFile(logFile(), line, { mode: 0o600 }).catch(() => undefined)
 }
 
 /** The host this window shows. */
@@ -65,8 +67,43 @@ function hostById(id) {
   if (host === undefined) throw new Error(`unknown host ${String(id)}`)
   return host
 }
-/** Each host has its own loopback port, so cookies and page storage never mix between servers. */
+/** The active server's tunnel origin. */
 function appOrigin() { return `http://127.0.0.1:${activeHost().localPort}` }
+/**
+ * Each server gets its own persistent browser session: cookies ignore ports, so separate
+ * loopback ports alone would send one server's auth cookie to another.
+ */
+function hostPartition(host) { return `persist:dsh-remote-${host.id}` }
+const configuredSessions = new Set()
+function hostSession(host) {
+  const ses = session.fromPartition(hostPartition(host))
+  if (!configuredSessions.has(ses)) {
+    configuredSessions.add(ses)
+    // microphone-permissions.ts: only the main window's top frame on the tunnel origin may ask,
+    // only for audio (dictation), and macOS still asks the user. Other permissions are denied
+    // except clipboard and notifications for that same frame.
+    const owned = (contents, frameUrl, isMainFrame) => contents != null && contents === mainWindow?.webContents && isMainFrame && isAppUrl(frameUrl)
+    ses.setPermissionCheckHandler((contents, permission, origin, details) => {
+      if (permission === 'media') {
+        return owned(contents, origin, details.isMainFrame) && details.mediaType === 'audio'
+          && (process.platform !== 'darwin' || systemPreferences.getMediaAccessStatus('microphone') === 'granted')
+      }
+      return ['clipboard-read', 'clipboard-sanitized-write', 'notifications'].includes(permission) && owned(contents, origin, details.isMainFrame)
+    })
+    ses.setPermissionRequestHandler((contents, permission, callback, details) => {
+      if (permission === 'media') {
+        const audioOnly = Array.isArray(details.mediaTypes) && details.mediaTypes.length === 1 && details.mediaTypes[0] === 'audio'
+        if (!owned(contents, details.requestingUrl, details.isMainFrame) || !audioOnly) { callback(false); return }
+        if (process.platform !== 'darwin') { callback(true); return }
+        void systemPreferences.askForMediaAccess('microphone').then(callback, () => { callback(false) })
+        return
+      }
+      callback(['clipboard-read', 'clipboard-sanitized-write', 'notifications'].includes(permission)
+        && owned(contents, details.requestingUrl, details.isMainFrame))
+    })
+  }
+  return ses
+}
 
 function statusPage(title, detail) {
   const escape = text => text.replace(/[&<>]/gu, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c])
@@ -95,22 +132,39 @@ function readDeviceInfo() {
   return fields.join('; ')
 }
 
-/** Resolve the active server's launch token and (re)open its forward. */
-async function connect() {
+/** Thrown when a newer connect (switch, reconnect) replaced this one while it was in flight. */
+class Superseded extends Error {}
+
+/**
+ * Resolve the active server's launch token and (re)open its forward.
+ * @param {number} generation - value of connectGeneration when this attempt started; a newer
+ *   attempt makes every later step of this one stop and release what it opened.
+ */
+async function connect(generation) {
+  const current = () => generation === connectGeneration && !quitting
   const host = activeHost()
   const out = await runRemote(host.sshHost, launchScript(host))
+  if (!current()) throw new Superseded()
   const launch = parseLaunchUrl(out)
   if (launch === undefined) throw new Error(`no "dsh web" launch line in ${host.serverLog} on ${host.sshHost}; use Settings → Remote servers → Set up server`)
   tunnel?.stop()
-  tunnel = new Tunnel(host.sshHost, host.localPort, launch, (code, stderr) => {
+  const opened = new Tunnel(host.sshHost, host.localPort, launch, (code, stderr) => {
     log(`tunnel exited code=${String(code)} ${stderr}`)
+    if (tunnel !== opened) return
+    tunnel = undefined
+    if (mainWindow !== undefined && !mainWindow.isDestroyed() && isAppUrl(mainWindow.webContents.getURL())) {
+      void mainWindow.loadURL(statusPage(`Reconnecting to ${host.name}…`, ''))
+    }
     void reconnect()
   })
-  await tunnel.start()
+  tunnel = opened
+  await opened.start()
+  if (!current()) { opened.stop(); throw new Superseded() }
   log(`connected ${host.id} (${host.sshHost}) -> ${launch.host}:${launch.port} on 127.0.0.1:${host.localPort}`)
   globalThis.__DSH_REMOTE_APP_ORIGIN__ = appOrigin()
   const url = localLaunchUrl(host.localPort, launch.token)
   const cookie = await authenticate(url)
+  if (!current()) throw new Superseded()
   invokeHost = hostRpc(appOrigin(), cookie)
   stopAccountWatch?.()
   stopAccountWatch = watchAccountSignIn(appOrigin(), cookie, {
@@ -123,17 +177,19 @@ async function connect() {
 
 async function openApp() {
   if (mainWindow === undefined || mainWindow.isDestroyed()) return
+  const generation = ++connectGeneration
   const host = activeHost()
   mainWindow.setTitle(`DeepSeek Harness — ${host.name}`)
   void mainWindow.loadURL(statusPage(`Connecting to ${host.name}…`, ''))
   try {
-    const url = await connect()
-    await mainWindow?.loadURL(url)
+    const url = await connect(generation)
+    if (generation === connectGeneration) await mainWindow?.loadURL(url)
   } catch (error) {
+    if (error instanceof Superseded || generation !== connectGeneration) return
     log(`connect failed: ${error.message}`)
     const others = config.hosts.filter(item => item.id !== host.id).map(item => item.name).join(', ')
     void mainWindow?.loadURL(statusPage(`Cannot reach DeepSeek Harness on ${host.name}`,
-      `${redact(error.message)}\n\nReconnect: Cmd+Shift+R${others ? `\nSwitch server: Connection menu (${others})` : ''}\nSettings file: ${configFile()}`))
+      `${redact(error.message)}\n\nNot set up yet? Connection → Set up this server…\nReconnect: Cmd+Shift+R${others ? `\nSwitch server: Connection menu (${others})` : ''}\nAdd servers before any is set up: Connection → Open settings file`))
   }
 }
 
@@ -141,30 +197,63 @@ async function openApp() {
 async function switchHost(id) {
   hostById(id)
   if (id === config.activeHostId && tunnel !== undefined) return
-  config = await saveConfig(configFile(), { ...config, activeHostId: id })
+  config = await updateConfig(configFile(), current => ({ ...current, activeHostId: id }), () => config)
+  connectGeneration++
   stopAccountWatch?.()
   stopAccountWatch = undefined
   invokeHost = undefined
   tunnel?.stop()
   tunnel = undefined
   buildMenu()
-  await openApp()
+  // The window belongs to the previous server's session; open the next one in its own.
+  const previous = mainWindow
+  createWindow(previous !== undefined && !previous.isDestroyed() ? previous.getBounds() : undefined)
+  if (previous !== undefined && !previous.isDestroyed()) previous.destroy()
+}
+
+/**
+ * Install or complete DeepSeek Harness on a server, after a native confirmation.
+ * @param {string} id - host id from remote.json.
+ * @returns {Promise<{ output: string }>} the tail of the setup output, tokens masked.
+ */
+async function setupHost(id) {
+  const host = hostById(id)
+  if (!await confirmNative(`Set up DeepSeek Harness on "${host.name}"?`,
+    `SSH host: ${host.sshHost}\nInstalls what is missing: @deepseek-ai/dsh and dsh-tui (npm), pnpm, a "server" profile, the dsh-remote-servers bundle, and the systemd user service ${host.serverUnit} listening on 127.0.0.1:${host.serverPort}.`,
+    'Set up')) throw new Error('cancelled')
+  log(`setup started on ${host.id}`)
+  // build-mac.sh packs the dsh-remote-servers bundle next to main.js.
+  const tarball = (await readFile(fileURLToPath(new URL('./dsh-remote-servers.tgz', import.meta.url)))).toString('base64')
+  const output = await runRemote(host.sshHost, setupScript(host, tarball), 15 * 60_000)
+  log(`setup finished on ${host.id}`)
+  return { output: redact(output).slice(-4000) }
+}
+
+/** Ask in a native dialog the page cannot answer. */
+async function confirmNative(message, detail, action) {
+  const window = mainWindow
+  if (window === undefined || window.isDestroyed()) return false
+  const { response } = await dialog.showMessageBox(window, {
+    type: 'question', buttons: [action, 'Cancel'], defaultId: 1, cancelId: 1, message, detail,
+  })
+  return response === 0
 }
 
 async function reconnect() {
   if (quitting || reconnecting || mainWindow === undefined || mainWindow.isDestroyed()) return
   reconnecting = true
+  const generation = connectGeneration
   try {
     await new Promise((resolve) => { setTimeout(resolve, RECONNECT_DELAY_MS) })
-    if (!quitting) await openApp()
+    if (!quitting && generation === connectGeneration) await openApp()
   } finally { reconnecting = false }
 }
 
 /** Official createWindow(): hiddenInset traffic lights inside the sidebar, sidebar vibrancy. */
-function createWindow() {
+function createWindow(bounds) {
   const darwin = process.platform === 'darwin'
   mainWindow = new BrowserWindow({
-    width: 1280, height: 820, minWidth: 520, minHeight: 600,
+    width: 1280, height: 820, ...(bounds ?? {}), minWidth: 520, minHeight: 600,
     title: 'DeepSeek Harness',
     ...(darwin ? {
       titleBarStyle: 'hiddenInset',
@@ -176,6 +265,7 @@ function createWindow() {
     webPreferences: {
       preload: fileURLToPath(new URL('./preload.cjs', import.meta.url)),
       contextIsolation: true, sandbox: true, nodeIntegration: false, webSecurity: true,
+      session: hostSession(activeHost()),
     },
   })
   const window = mainWindow
@@ -203,20 +293,33 @@ function createWindow() {
     if (/^https?:\/\//u.test(url) && !isAppUrl(url)) void shell.openExternal(url)
     return { action: 'deny' }
   })
+  // A server redirect gets the same rule as a page navigation.
+  contents.on('will-redirect', (event, url) => {
+    if (isAppUrl(url)) return
+    event.preventDefault()
+    if (/^https?:\/\//u.test(url)) void shell.openExternal(url)
+  })
+  // Without a tunnel, nothing on the tunnel port belongs to the server any more.
+  contents.on('will-navigate', (event, url) => { if (isAppUrl(url) && tunnel === undefined) event.preventDefault() })
   contents.on('did-create-window', (child) => {
+    // The popup is only a hand-off point for the sign-in page; never let it linger in the background.
+    const closeTimer = setTimeout(() => { if (!child.isDestroyed()) child.close() }, 30_000)
+    child.on('closed', () => { clearTimeout(closeTimer) })
     child.webContents.on('will-navigate', (event, url) => {
       event.preventDefault()
       if (/^https?:\/\//u.test(url)) void shell.openExternal(url)
       child.close()
     })
   })
+  // will-navigate fires only for page-initiated navigation (status pages load through
+  // loadURL), so the remote page may navigate within the tunnel origin and nowhere else.
   contents.on('will-navigate', (event, url) => {
-    if (isAppUrl(url) || url.startsWith('data:text/html')) return
+    if (isAppUrl(url)) return
     event.preventDefault()
     if (/^https?:\/\//u.test(url)) void shell.openExternal(url)
   })
   shortcuts.attach(window)
-  window.on('closed', () => { mainWindow = undefined })
+  window.on('closed', () => { if (mainWindow === window) mainWindow = undefined })
   void openApp()
 }
 
@@ -255,17 +358,24 @@ function installIpc() {
 
   // Remote servers page. Arguments are untrusted renderer input: ids are looked up, never used
   // as paths or shell text; new hosts go through resolveConfig validation before anything runs.
+  // The page is served by the connected server, so a compromised server must not be able to
+  // add hosts or install software on the user's other servers: those two actions need a native
+  // confirmation the page cannot answer.
   ipcMain.handle(IPC.remoteList, (event) => { assertOwned(event); return config })
   ipcMain.handle(IPC.remoteAdd, async (event, draft) => {
     assertOwned(event)
     if (typeof draft !== 'object' || draft === null || typeof draft.sshHost !== 'string') throw new Error('invalid server')
     const sshHost = draft.sshHost.trim()
     const name = typeof draft.name === 'string' && draft.name.trim() !== '' ? draft.name.trim() : sshHost
-    const taken = new Set(config.hosts.map(host => host.id))
-    let id = slug(name)
-    for (let n = 2; taken.has(id); n++) id = `${slug(name).slice(0, 36)}-${n}`
-    const host = { id, name, sshHost, localPort: nextLocalPort(config.hosts), ...HOST_DEFAULTS }
-    config = await saveConfig(configFile(), { ...config, hosts: [...config.hosts, host] })
+    if (!await confirmNative(`Add the server "${name.slice(0, 60)}"?`,
+      `SSH host: ${sshHost.slice(0, 120)}\nThis app will connect to it with your SSH keys.`, 'Add')) throw new Error('cancelled')
+    let id
+    config = await updateConfig(configFile(), (current) => {
+      const taken = new Set(current.hosts.map(host => host.id))
+      id = slug(name)
+      for (let n = 2; taken.has(id); n++) id = `${slug(name).slice(0, 36)}-${n}`
+      return { ...current, hosts: [...current.hosts, { ...HOST_DEFAULTS, id, name, sshHost, localPort: nextLocalPort(current.hosts) }] }
+    }, () => config)
     log(`added host ${id} (${sshHost})`)
     buildMenu()
     return config
@@ -274,7 +384,10 @@ function installIpc() {
     assertOwned(event)
     const host = hostById(id)
     if (host.id === config.activeHostId) throw new Error('switch to another server before removing this one')
-    config = await saveConfig(configFile(), { ...config, hosts: config.hosts.filter(item => item.id !== host.id) })
+    if (!await confirmNative(`Remove "${host.name}" from this app?`, `SSH host: ${host.sshHost}\nNothing on the server is deleted.`, 'Remove')) throw new Error('cancelled')
+    config = await updateConfig(configFile(), current => ({ ...current, hosts: current.hosts.filter(item => item.id !== host.id) }), () => config)
+    // A later server added under the same id must not inherit this one's cookies or storage.
+    await session.fromPartition(hostPartition(host)).clearStorageData().catch(() => undefined)
     log(`removed host ${host.id}`)
     buildMenu()
     return config
@@ -284,22 +397,27 @@ function installIpc() {
     const host = hostById(id)
     return parseProbe(await runRemote(host.sshHost, probeScript(host)))
   })
-  ipcMain.handle(IPC.remoteSetup, async (event, id) => {
-    assertOwned(event)
-    const host = hostById(id)
-    log(`setup started on ${host.id}`)
-    // build-mac.sh packs the dsh-remote-servers bundle next to main.js.
-    const tarball = (await readFile(fileURLToPath(new URL('./dsh-remote-servers.tgz', import.meta.url)))).toString('base64')
-    const output = await runRemote(host.sshHost, setupScript(host, tarball), 15 * 60_000)
-    log(`setup finished on ${host.id}`)
-    return { output: redact(output).slice(-4000) }
-  })
+  ipcMain.handle(IPC.remoteSetup, (event, id) => { assertOwned(event); return setupHost(id) })
   ipcMain.handle(IPC.remoteSwitch, async (event, id) => {
     assertOwned(event)
+    const target = hostById(id)
+    if (target.id !== config.activeHostId
+      && !await confirmNative(`Switch to "${target.name}"?`, `SSH host: ${target.sshHost}`, 'Switch')) throw new Error('cancelled')
     // Reply before the window navigates away from the page that asked.
     setTimeout(() => { void switchHost(id).catch((error) => { log(`switch failed: ${error.message}`) }) }, 50)
   })
-  ipcMain.handle(IPC.remoteSshAliases, (event) => { assertOwned(event); return readSshAliases() })
+  // The page never receives ~/.ssh/config contents: aliases are offered in a native menu.
+  ipcMain.handle(IPC.remoteSshAliases, async (event) => {
+    assertOwned(event)
+    const aliases = await readSshAliases()
+    const window = mainWindow
+    if (aliases.length === 0 || window === undefined || window.isDestroyed()) return null
+    return new Promise((resolve) => {
+      let picked = null
+      Menu.buildFromTemplate(aliases.slice(0, 50).map(alias => ({ label: alias, click: () => { picked = alias } })))
+        .popup({ window, callback: () => { resolve(picked) } })
+    })
+  })
 }
 
 /** Official macEditMenu(): Paste and Match Style on Shift+Command+V. */
@@ -325,6 +443,11 @@ function buildMenu() {
           click: () => { void switchHost(host.id).catch((error) => { log(`switch failed: ${error.message}`) }) },
         })),
         { type: 'separator' },
+        { label: 'Set up this server…', click: () => {
+          void setupHost(config.activeHostId).then(() => openApp(), (error) => {
+            if (!/cancelled$/u.test(error.message)) void dialog.showMessageBox({ type: 'error', message: 'Setup failed', detail: redact(error.message).slice(-2000) })
+          })
+        } },
         { label: 'Reconnect', accelerator: 'CmdOrCtrl+Shift+R', click: () => { void openApp() } },
         { label: 'Reload page', click: () => { mainWindow?.webContents.reload() } },
         { type: 'separator' },
@@ -345,14 +468,13 @@ else {
   app.whenReady().then(async () => {
     try {
       config = await loadConfig(configFile())
+      // Logs written by earlier versions were created with the default mode.
+      await chmod(logFile(), 0o600).catch(() => undefined)
     } catch (error) {
       dialog.showErrorBox('DeepSeek Harness Remote', error.message)
       app.exit(1)
       return
     }
-    session.defaultSession.setPermissionRequestHandler((wc, permission, callback) => {
-      callback(['clipboard-read', 'clipboard-sanitized-write', 'notifications', 'media'].includes(permission) && isAppUrl(wc.getURL()))
-    })
     // The bundled keyboard.ts admits IPC only from this origin (see vendor/build-desktop-keyboard.mjs).
     globalThis.__DSH_REMOTE_APP_ORIGIN__ = appOrigin()
     const platform = process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux'
@@ -364,6 +486,6 @@ else {
     app.on('activate', () => { if (mainWindow === undefined) createWindow(); else mainWindow.show() })
   }).catch((error) => { dialog.showErrorBox('DeepSeek Harness Remote', String(error)); app.exit(1) })
   app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
-  app.on('before-quit', () => { quitting = true; stopAccountWatch?.(); tunnel?.stop() })
+  app.on('before-quit', () => { quitting = true; connectGeneration++; stopAccountWatch?.(); tunnel?.stop() })
   app.on('will-quit', () => { shortcuts?.dispose() })
 }

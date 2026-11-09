@@ -18,10 +18,16 @@ const READY_TIMEOUT_MS = 20_000
  */
 export function runRemote(sshHost, script, timeoutMs = 90_000) {
   return new Promise((resolve, reject) => {
-    execFile(SSH, [...SSH_OPTIONS, '--', sshHost, script], { timeout: timeoutMs, maxBuffer: 4 << 20 }, (error, stdout, stderr) => {
-      if (error) reject(new Error(`ssh ${sshHost}: ${(stderr || error.message).trim()}`))
+    // The script travels on stdin, so its size is not bound by the remote argv limit. It is
+    // saved to a private temp file and run with stdin closed: under `sh -s`, commands that read
+    // stdin (npm, pnpm) would swallow the rest of the script.
+    const runner = 'umask 077; f=$(mktemp) || exit 90; trap \'rm -f "$f"\' EXIT; cat >"$f"; sh "$f" </dev/null'
+    const child = execFile(SSH, [...SSH_OPTIONS, '--', sshHost, runner], { timeout: timeoutMs, maxBuffer: 4 << 20 }, (error, stdout, stderr) => {
+      if (error) reject(new Error(`ssh ${sshHost}: ${(stderr || error.message).trim().slice(-2000)}`))
       else resolve(stdout)
     })
+    child.stdin.on('error', () => { /* ssh exited early; the callback reports why */ })
+    child.stdin.end(script)
   })
 }
 

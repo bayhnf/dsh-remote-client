@@ -39,6 +39,8 @@ export function launchScript({ serverLog, serverUnit }) {
   const log = serverLog.startsWith('~/') ? `"$HOME/${serverLog.slice(2)}"` : `"${serverLog}"`
   return [
     `L=${log}; U=${serverUnit}`,
+    // The log holds the reusable launch token: keep it owner-only on every connect.
+    'chmod 700 "$(dirname "$L")" 2>/dev/null; chmod 600 "$L" 2>/dev/null',
     'if ! systemctl --user is-active --quiet "$U"; then',
     '  n=$(wc -l < "$L" 2>/dev/null || echo 0); mkdir -p "$(dirname "$L")"',
     '  systemctl --user reset-failed "$U" 2>/dev/null; systemctl --user start "$U" || exit 3',
@@ -47,7 +49,7 @@ export function launchScript({ serverLog, serverUnit }) {
     '    [ -n "$t" ] && { printf "%s\\n" "$t"; exit 0; }; sleep 1',
     '  done; exit 4',
     'fi',
-    'tail -n 400 "$L" | grep -a "dsh web: http" | tail -n 1',
+    'grep -a "dsh web: http" -- "$L" | tail -n 1',
   ].join('\n')
 }
 
@@ -57,5 +59,8 @@ export function launchScript({ serverLog, serverUnit }) {
  * @returns {string} text with token values masked.
  */
 export function redact(text) {
-  return String(text).replace(/token=[A-Za-z0-9_-]+/gu, 'token=<redacted>')
+  return String(text)
+    .replace(/token=[^\s&"'<>]+/gu, 'token=<redacted>')
+    .replace(/(dsh-auth-[A-Za-z0-9_-]*=)[^\s;"']+/gu, '$1<redacted>')
+    .replace(/((?:set-)?cookie:\s*)[^\n]+/giu, '$1<redacted>')
 }

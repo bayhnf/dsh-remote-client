@@ -13,9 +13,11 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # Source: an installed official app, or a `ditto -c -k --keepParent` zip of one (kept so the
 # official app does not have to stay installed next to this client).
-DEFAULT_SRC="/Applications/DeepSeek Harness.app"
-[ -d "$DEFAULT_SRC" ] || DEFAULT_SRC="$(ls -t "$HOME"/dsh-remote-work/DeepSeek-Harness-*.app.zip 2>/dev/null | head -n 1)"
-SRC_APP="${1:-$DEFAULT_SRC}"
+SRC_APP="${1:-}"
+if [ -z "$SRC_APP" ]; then
+  if [ -d "/Applications/DeepSeek Harness.app" ]; then SRC_APP="/Applications/DeepSeek Harness.app"
+  else SRC_APP="$(ls -t "$HOME"/dsh-remote-work/DeepSeek-Harness-*.app.zip 2>/dev/null | head -n 1 || true)"; fi
+fi
 OUT_DIR="${2:-$HOME/Applications}"
 NAME="DeepSeek Harness Remote"
 BUNDLE_ID="${DSH_REMOTE_BUNDLE_ID:-io.github.dsh-remote-client}"
@@ -35,7 +37,6 @@ command -v npx >/dev/null || { echo "npx (Node.js) is required" >&2; exit 1; }
 
 echo "== copy $SRC_APP"
 mkdir -p "$OUT_DIR"
-rm -rf "$OUT_APP"
 ditto "$SRC_APP" "$WORK/$NAME.app"
 APP="$WORK/$NAME.app"
 RES="$APP/Contents/Resources"
@@ -72,6 +73,9 @@ xattr -cr "$APP"
 codesign --force --deep --sign - --timestamp=none "$APP"
 codesign --verify --deep --strict "$APP"
 
+# Replace the previous build only after this one is complete and verified.
+if [ -e "$OUT_APP" ]; then rm -rf "$OUT_APP.previous"; mv "$OUT_APP" "$OUT_APP.previous"; fi
 mv "$APP" "$OUT_APP"
+rm -rf "$OUT_APP.previous"
 echo "built: $OUT_APP"
 echo "settings: ~/Library/Application Support/$NAME/remote.json (created on first launch)"

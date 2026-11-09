@@ -23,9 +23,12 @@ test('localLaunchUrl targets loopback so DeepSeek sign-in accepts the origin', (
   assert.equal(localLaunchUrl(43080, '-_a'), 'http://127.0.0.1:43080/?token=-_a')
 })
 
-test('redact masks every token value', () => {
+test('redact masks tokens and auth cookies', () => {
   assert.equal(redact(LOG).includes('NEW_tok'), false)
   assert.equal(redact(LOG).includes('OLD_tok'), false)
+  assert.equal(redact('token=a.b~c%2F').includes('a.b'), false)
+  assert.equal(redact('set-cookie: dsh-auth-x=SECRETVALUE; Path=/').includes('SECRETVALUE'), false)
+  assert.equal(redact('dsh-auth-abc=SECRETVALUE').includes('SECRETVALUE'), false)
 })
 
 test('launchScript expands a home-relative log path and names the unit', () => {
@@ -42,6 +45,9 @@ test('resolveHost rejects values that could inject into ssh or the remote shell'
   assert.throws(() => resolveHost({ ...base, localPort: 80 }), /localPort/u)
   assert.throws(() => resolveHost({ ...base, id: '../etc' }), /host id/u)
   assert.throws(() => resolveHost({ ...base, serverPort: 0 }), /serverPort/u)
+  assert.throws(() => resolveHost({ ...base, serverLog: '-f' }), /serverLog/u)
+  assert.throws(() => resolveHost({ ...base, serverLog: 'relative/log' }), /serverLog/u)
+  assert.throws(() => resolveHost({ ...base, serverUnit: '--x.service' }), /serverUnit/u)
 })
 
 test('resolveConfig migrates the single-host form and keeps a valid active host', () => {
@@ -78,6 +84,9 @@ test('probe and setup scripts are valid POSIX sh', async () => {
   const { execFileSync } = await import('node:child_process')
   for (const script of [probeScript(HOST), setupScript(HOST, 'AAAA')]) execFileSync('sh', ['-n', '-c', script])
   assert.match(setupScript(HOST, 'AAAA'), /--host 127\.0\.0\.1 --port 3080 --no-open/u)
+  assert.match(setupScript(HOST, 'AAAA'), /UMask=0077/u)
+  assert.match(setupScript(HOST, 'AAAA'), /chmod 600 "\$L"/u)
+  assert.match(launchScript(HOST), /chmod 600 "\$L"/u)
   assert.throws(() => setupScript(HOST, "x'; reboot; '"), /base64/u)
 })
 
@@ -85,11 +94,80 @@ test('parseSshAliases keeps concrete names only', () => {
   assert.deepEqual(parseSshAliases('Host gpu-box devbox\n  HostName x\nHost *.example *\nhost laptop\nHost !bad'), ['devbox', 'gpu-box', 'laptop'])
 })
 
-test('authorizeDestination accepts https and loopback http only', () => {
+test('authorizeDestination accepts the DeepSeek Platform host and loopback http only', () => {
   assert.equal(authorizeDestination('https://platform.deepseek.com/dsh/authorize?x=1'), 'https://platform.deepseek.com/dsh/authorize?x=1')
+  assert.equal(authorizeDestination('https://phish.example/dsh/authorize'), undefined)
   assert.equal(authorizeDestination('http://127.0.0.1:43080/oauth/callback'), 'http://127.0.0.1:43080/oauth/callback')
   assert.equal(authorizeDestination('http://evil.example/dsh/authorize'), undefined)
   assert.equal(authorizeDestination('https://user:pw@platform.deepseek.com/dsh/authorize'), undefined)
   assert.equal(authorizeDestination('file:///etc/passwd'), undefined)
   assert.equal(authorizeDestination('not a url'), undefined)
+})
+
+// ---- regression tests for the pre-release audit (offline, temporary homes only) ----
+import { mkdtemp, writeFile as writeFileFs, readFile as readFileFs, mkdir as mkdirFs, chmod as chmodFs, readdir } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { execFileSync } from 'node:child_process'
+import { saveConfig, updateConfig, loadConfig } from '../app/lib/config.js'
+import { watchAccountSignIn } from '../app/lib/account-watch.js'
+import net from 'node:net'
+
+/** Run a generated script with a fake systemctl that reports the given state. */
+async function runScript(script, { active, log }) {
+  const home = await mkdtemp(join(tmpdir(), 'dshrc-'))
+  const bin = join(home, 'bin')
+  await mkdirFs(join(home, '.dsh', 'logs'), { recursive: true })
+  await mkdirFs(bin)
+  await writeFileFs(join(bin, 'systemctl'), `#!/bin/sh\nexit ${active ? 0 : 3}\n`)
+  await chmodFs(join(bin, 'systemctl'), 0o755)
+  if (log !== undefined) await writeFileFs(join(home, '.dsh', 'logs', 'server-web.log'), log)
+  return execFileSync('sh', ['-c', script], { env: { HOME: home, PATH: `${bin}:/usr/bin:/bin` }, encoding: 'utf8' })
+}
+
+test('probe reports a numeric not-ready state for empty or launch-less logs', async () => {
+  for (const log of [undefined, '', 'starting\nfailed\n']) {
+    const report = parseProbe(await runScript(probeScript(HOST), { active: false, log }))
+    assert.equal(report.ready, false)
+  }
+})
+
+test('launchScript finds the launch line however long the log has grown', async () => {
+  const log = `dsh web: http://127.0.0.1:3080/?token=abc_1\n${'noise\n'.repeat(5000)}`
+  const out = await runScript(launchScript(HOST), { active: true, log })
+  assert.deepEqual(parseLaunchUrl(out), { host: '127.0.0.1', port: 3080, token: 'abc_1' })
+})
+
+test('concurrent config writes stay consistent on disk and in memory', async () => {
+  const file = join(await mkdtemp(join(tmpdir(), 'dshrc-')), 'remote.json')
+  let current = await saveConfig(file, { activeHostId: 'a', hosts: [{ id: 'a', sshHost: 'a', localPort: 43080 }, { id: 'b', sshHost: 'b', localPort: 43081 }] })
+  const writes = []
+  for (let i = 0; i < 20; i++) {
+    const target = i % 2 === 0 ? 'a' : 'b'
+    writes.push(updateConfig(file, c => ({ ...c, activeHostId: target }), () => current).then((next) => { current = next }))
+  }
+  await Promise.all(writes)
+  const onDisk = JSON.parse(await readFileFs(file, 'utf8'))
+  assert.equal(onDisk.activeHostId, current.activeHostId)
+  assert.equal(onDisk.activeHostId, 'b')
+  assert.deepEqual((await readdir(join(file, '..'))).filter(name => name.endsWith('.tmp')), [])
+})
+
+test('a malformed modern config is rejected, not rewritten', async () => {
+  const file = join(await mkdtemp(join(tmpdir(), 'dshrc-')), 'remote.json')
+  const original = JSON.stringify({ activeHostId: 'x', hosts: { id: 'x', sshHost: 'x' } })
+  await writeFileFs(file, original)
+  await assert.rejects(loadConfig(file), /hosts must be an array/u)
+  assert.equal(await readFileFs(file, 'utf8'), original)
+})
+
+test('stopping the account watch while it is still connecting does not throw', async () => {
+  const server = net.createServer(() => {})
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  const { port } = server.address()
+  const stop = watchAccountSignIn(`http://127.0.0.1:${port}`, 'dsh-auth-x=y', { open() {}, theme: () => 'dark', log() {} })
+  stop()
+  stop()
+  await new Promise(resolve => setTimeout(resolve, 300))
+  server.close()
 })

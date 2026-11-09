@@ -7,8 +7,12 @@ import { randomUUID } from 'node:crypto'
 
 const STREAM_PATH = '/api/remote.mux'
 
+/** Hosts whose sign-in pages the app opens; override with DSH_REMOTE_SIGNIN_HOSTS (comma-separated). */
+const SIGNIN_HOSTS = (process.env.DSH_REMOTE_SIGNIN_HOSTS ?? 'platform.deepseek.com').split(',').map(host => host.trim()).filter(Boolean)
+
 /**
- * Accept https pages or loopback http, without URL credentials (account-backend.ts validateBrowserDestination).
+ * Accept DeepSeek Platform pages over https, or loopback http, without URL credentials
+ * (account-backend.ts validateBrowserDestination, narrowed to the sign-in hosts).
  * @param {string} value - authorizeUrl from the Host.
  * @returns {string | undefined} the URL, or undefined when it is not an allowed destination.
  */
@@ -16,7 +20,8 @@ export function authorizeDestination(value) {
   let url
   try { url = new URL(value) } catch { return undefined }
   const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
-  if (url.username || url.password || !(url.protocol === 'https:' || (loopback && url.protocol === 'http:'))) return undefined
+  if (url.username || url.password) return undefined
+  if (!((url.protocol === 'https:' && SIGNIN_HOSTS.includes(url.hostname)) || (loopback && url.protocol === 'http:'))) return undefined
   return url.href
 }
 
@@ -54,8 +59,14 @@ export function watchAccountSignIn(origin, cookie, shell) {
       shell.open(target.href)
     })
     socket.addEventListener('close', () => { if (!closed) retry = setTimeout(connect, 1000) })
-    socket.addEventListener('error', () => { socket.close() })
+    // An error is always followed by close, which schedules the retry; closing here would recurse.
+    socket.addEventListener('error', () => {})
   }
   connect()
-  return () => { closed = true; clearTimeout(retry); socket?.close() }
+  return () => {
+    if (closed) return
+    closed = true
+    clearTimeout(retry)
+    try { socket?.close() } catch { /* already closing */ }
+  }
 }

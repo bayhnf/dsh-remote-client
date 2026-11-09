@@ -22,12 +22,13 @@ const logPath = serverLog => serverLog.startsWith('~/') ? `$HOME/${serverLog.sli
  */
 export function probeScript({ serverUnit, serverLog }) {
   return [
-    'export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:$PATH"',
+    'export PATH="$PATH:/usr/local/bin:$HOME/.npm-global/bin:$HOME/.local/bin"',
     `U=${serverUnit}; L="${logPath(serverLog)}"`,
-    'v() { "$@" 2>/dev/null | head -n 1 | tr -d "\\r\\"\\\\" ; }',
+    // Keep only characters a version string needs, so the value is safe inside the JSON report.
+    'v() { "$@" 2>/dev/null | head -n 1 | tr -cd "A-Za-z0-9._+-" ; }',
     'node_v=$(v node --version); dsh_v=$(v dsh --version); tui=$(command -v dsh-tui >/dev/null && echo yes || echo no)',
     'unit=$(systemctl --user is-active "$U" 2>/dev/null || true); [ -n "$unit" ] || unit=unknown',
-    'launch=$( [ -f "$L" ] && grep -a -c "dsh web: http" "$L" 2>/dev/null || echo 0)',
+    'launch=$(grep -a -c "dsh web: http" -- "$L" 2>/dev/null); case "$launch" in ""|*[!0-9]*) launch=0;; esac',
     `plugin=$(grep -q '"${PLUGIN}"' "$HOME/.dsh/profiles/server/package.json" 2>/dev/null && echo yes || echo no)`,
     `printf '${REPORT}{"hostname":"%s","os":"%s","node":"%s","dsh":"%s","dshTui":"%s","unit":"%s","launchLines":%s,"plugin":"%s"}\\n' "$(hostname)" "$(uname -s)" "$node_v" "$dsh_v" "$tui" "$unit" "$launch" "$plugin"`,
   ].join('\n')
@@ -61,7 +62,7 @@ export function setupScript({ serverUnit, serverLog, serverPort }, pluginTarball
   if (!/^[A-Za-z0-9+/=]+$/u.test(pluginTarball)) throw new Error('plugin tarball must be base64')
   return [
     'set -eu',
-    'export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:$PATH"',
+    'export PATH="$PATH:/usr/local/bin:$HOME/.npm-global/bin:$HOME/.local/bin"',
     'say() { printf "== %s\\n" "$*"; }',
     'command -v node >/dev/null || { echo "Node.js 22.19+ is required on this host (install it, then retry)" >&2; exit 10; }',
     'node -e "const [a,b]=process.versions.node.split(\'.\').map(Number); process.exit(a>22||(a===22&&b>=19)?0:1)" || { echo "Node.js $(node --version) is too old; 22.19+ is required" >&2; exit 11; }',
@@ -69,19 +70,25 @@ export function setupScript({ serverUnit, serverLog, serverPort }, pluginTarball
     'need=""; command -v dsh >/dev/null || need="$need @deepseek-ai/dsh"; command -v dsh-tui >/dev/null || need="$need @deepseek-harness-tui/dsh-tui"',
     'if [ -n "$need" ]; then',
     '  PREFIX=$(npm config get prefix)',
-    '  if [ ! -w "$PREFIX/lib/node_modules" ] && [ ! -w "$PREFIX" ]; then npm config set prefix "$HOME/.npm-global"; export PATH="$HOME/.npm-global/bin:$PATH"; fi',
-    '  say "install$need"; npm install -g --no-fund --no-audit --loglevel=error $need >/dev/null',
+    '  if [ ! -w "$PREFIX/lib/node_modules" ] && [ ! -w "$PREFIX" ]; then PREFIX="$HOME/.npm-global"; fi',
+    '  say "install$need into $PREFIX"; npm install -g --prefix "$PREFIX" --no-fund --no-audit --loglevel=error $need >/dev/null',
+    '  export PATH="$PATH:$PREFIX/bin"',
     'fi',
     'DSH=$(command -v dsh); say "dsh $("$DSH" --version) at $DSH"',
     // `dsh plugin` runs pnpm in the profile directory; corepack ships with Node and provides it.
     'if ! command -v pnpm >/dev/null; then',
     '  say "enable pnpm"',
     '  if command -v corepack >/dev/null && corepack enable --install-directory "$(dirname "$DSH")" pnpm 2>/dev/null && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 pnpm --version >/dev/null 2>&1; then :',
-    '  else npm install -g --no-fund --no-audit pnpm >/dev/null; fi',
+    '  else npm install -g --prefix "$(npm config get prefix)" --no-fund --no-audit pnpm >/dev/null 2>&1 || npm install -g --prefix "$HOME/.npm-global" --no-fund --no-audit pnpm >/dev/null; fi',
     'fi',
     'export COREPACK_ENABLE_DOWNLOAD_PROMPT=0',
-    `L="${logPath(serverLog)}"; mkdir -p "$(dirname "$L")"`,
-    '[ -d "$HOME/.dsh/profiles/server" ] || { say "create server profile"; "$DSH" --profile server --from-default-profile web --dump-config >/dev/null; }',
+    // The log holds the reusable launch token: keep it owner-only.
+    `L="${logPath(serverLog)}"; umask 077; mkdir -p "$(dirname "$L")"; chmod 700 "$(dirname "$L")"; touch "$L"; chmod 600 "$L"`,
+    'P="$HOME/.dsh/profiles/server/package.json"',
+    // A missing or half-created profile is initialized from the shipped Web template; an existing
+    // profile without the Web bundle belongs to the user and is not replaced.
+    'if [ ! -f "$P" ]; then say "create server profile"; "$DSH" --profile server --from-default-profile web --dump-config >/dev/null',
+    'elif ! grep -q \'"@deepseek-ai/dsh-web-app"\' "$P"; then echo "~/.dsh/profiles/server exists but does not include @deepseek-ai/dsh-web-app; add it or move the profile away, then retry" >&2; exit 15; fi',
     'changed=no',
     `if ! grep -q '"${PLUGIN}"' "$HOME/.dsh/profiles/server/package.json"; then`,
     `  T="$HOME/.dsh/${PLUGIN}.tgz"; printf %s '${pluginTarball}' | base64 -d > "$T"`,
@@ -92,17 +99,26 @@ export function setupScript({ serverUnit, serverLog, serverPort }, pluginTarball
     '  say "create $UNIT"; mkdir -p "$(dirname "$UNIT")"',
     '  {',
     '    printf "[Unit]\\nDescription=DeepSeek Harness server (dsh-remote-client)\\nAfter=network-online.target\\n[Service]\\nType=simple\\nWorkingDirectory=%%h\\n"',
+    // The user manager has its own PATH; give the service the Node that setup found.
+    '    printf "Environment=PATH=%s:/usr/local/bin:/usr/bin:/bin\\n" "$(dirname "$(command -v node)")"',
     `    printf "ExecStart=%s --profile server --host 127.0.0.1 --port ${serverPort} --no-open\\n" "$DSH"`,
-    '    printf "Restart=always\\nRestartSec=5\\nStandardOutput=append:%s\\nStandardError=append:%s\\n[Install]\\nWantedBy=default.target\\n" "$L" "$L"',
+    '    printf "UMask=0077\\nRestart=always\\nRestartSec=5\\nStandardOutput=append:%s\\nStandardError=append:%s\\n[Install]\\nWantedBy=default.target\\n" "$L" "$L"',
     '  } > "$UNIT"',
     '  loginctl enable-linger "$(id -un)" 2>/dev/null || true',
     '  systemctl --user daemon-reload',
     'fi',
-    'touch "$L"; n=$(wc -l < "$L")',
+    'touch "$L"; n=$(wc -l < "$L"); started=yes',
     `if systemctl --user is-active --quiet ${serverUnit}; then`,
-    `  [ "$changed" = no ] || { say "restart ${serverUnit} to load ${PLUGIN}"; systemctl --user restart ${serverUnit}; }`,
+    `  if [ "$changed" = no ]; then started=no; else say "restart ${serverUnit} to load ${PLUGIN}"; systemctl --user restart ${serverUnit}; fi`,
     `else systemctl --user reset-failed ${serverUnit} 2>/dev/null || true; systemctl --user enable --now ${serverUnit} >/dev/null; fi`,
-    'for i in $(seq 1 60); do tail -n +$((n+1)) "$L" 2>/dev/null | grep -a -q "dsh web: http" && { say "server ready"; exit 0; }; [ "$changed" = no ] && grep -a -q "dsh web: http" "$L" && { say "server ready"; exit 0; }; sleep 1; done',
+    // A service started or restarted here must print a new launch line and stay active; an
+    // untouched running service is ready when it is active and has printed one before.
+    'for i in $(seq 1 60); do',
+    `  if systemctl --user is-active --quiet ${serverUnit}; then`,
+    '    if [ "$started" = yes ]; then tail -n +$((n+1)) -- "$L" | grep -a -q "dsh web: http" && { say "server ready"; exit 0; }',
+    '    else grep -a -q "dsh web: http" -- "$L" && { say "server ready"; exit 0; }; fi',
+    '  fi; sleep 1',
+    'done',
     'echo "server did not print its launch URL within 60 s; see $L" >&2; exit 13',
   ].join('\n')
 }

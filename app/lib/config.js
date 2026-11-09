@@ -4,7 +4,8 @@
  * Stored in remote.json under the app's userData. Edited from DSH Settings → Remote servers
  * (the dsh-remote-servers plugin, through the preload's dshRemote bridge) or by hand.
  */
-import { readFile, writeFile, mkdir, rename } from 'node:fs/promises'
+import { readFile, writeFile, mkdir, rename, rm } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { dirname } from 'node:path'
 
 /** Values every host starts from; a host entry overrides any of them. */
@@ -31,8 +32,8 @@ export const DEFAULT_CONFIG = Object.freeze({
 
 const ID = /^[a-z0-9][a-z0-9-]{0,39}$/u
 const SSH_HOST = /^[A-Za-z0-9._][A-Za-z0-9._@:-]*$/u
-const LOG_PATH = /^(~\/)?[A-Za-z0-9._/-]+$/u
-const UNIT = /^[A-Za-z0-9@._-]+\.service$/u
+const LOG_PATH = /^(?:~\/|\/)[A-Za-z0-9._/-]+$/u
+const UNIT = /^[A-Za-z0-9@][A-Za-z0-9@._-]*\.service$/u
 
 const fail = (message) => { throw new Error(`remote.json: ${message}`) }
 const isPort = (value, min) => Number.isInteger(value) && value >= min && value <= 65535
@@ -63,11 +64,13 @@ export function resolveHost(raw) {
  */
 export function resolveConfig(raw) {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) fail('expected a JSON object')
-  if (!Array.isArray(raw.hosts)) {
-    const legacy = { name: raw.sshHost ?? 'dsh-server', localPort: FIRST_LOCAL_PORT, ...DEFAULT_CONFIG.hosts[0], ...raw }
-    legacy.id = typeof legacy.sshHost === 'string' ? slug(legacy.sshHost) : legacy.id
+  if (!('hosts' in raw) && typeof raw.sshHost === 'string') {
+    const { sshHost, localPort, serverLog, serverUnit } = raw
+    const legacy = { ...HOST_DEFAULTS, id: slug(sshHost), name: sshHost, sshHost, localPort: localPort ?? FIRST_LOCAL_PORT,
+      ...(serverLog === undefined ? {} : { serverLog }), ...(serverUnit === undefined ? {} : { serverUnit }) }
     return resolveConfig({ activeHostId: legacy.id, hosts: [legacy] })
   }
+  if (!Array.isArray(raw.hosts)) fail('hosts must be an array')
   if (raw.hosts.length === 0) fail('at least one host is required')
   const hosts = raw.hosts.map(resolveHost)
   const ids = new Set()
@@ -99,9 +102,8 @@ export function slug(text) {
  */
 export function nextLocalPort(hosts) {
   const used = new Set(hosts.map(host => host.localPort))
-  let port = FIRST_LOCAL_PORT
-  while (used.has(port)) port++
-  return port
+  for (let port = FIRST_LOCAL_PORT; port <= 65535; port++) if (!used.has(port)) return port
+  throw new Error('no free local port left for another server')
 }
 
 /**
@@ -129,11 +131,38 @@ export async function loadConfig(file) {
  * @param {Record<string, unknown>} config - settings to store.
  * @returns {Promise<ReturnType<typeof resolveConfig>>} what was written.
  */
-export async function saveConfig(file, config) {
+export function saveConfig(file, config) {
+  const run = saveQueue.then(() => saveConfigNow(file, config))
+  saveQueue = run.catch(() => undefined)
+  return run
+}
+
+/** Saves run one after another, so the last write on disk is the last one requested. */
+let saveQueue = Promise.resolve()
+
+/**
+ * Apply one change to the current settings and store it, with no other change in between.
+ * @param {string} file - absolute path of remote.json.
+ * @param {(current: ReturnType<typeof resolveConfig>) => Record<string, unknown>} change - derives the next settings.
+ * @param {() => ReturnType<typeof resolveConfig>} current - reads the settings the change starts from.
+ * @returns {Promise<ReturnType<typeof resolveConfig>>} what was written.
+ */
+export function updateConfig(file, change, current) {
+  const run = saveQueue.then(() => saveConfigNow(file, change(current())))
+  saveQueue = run.catch(() => undefined)
+  return run
+}
+
+async function saveConfigNow(file, config) {
   const valid = resolveConfig(config)
   await mkdir(dirname(file), { recursive: true })
-  const temp = `${file}.${process.pid}.tmp`
-  await writeFile(temp, `${JSON.stringify(valid, null, 2)}\n`, { mode: 0o600 })
-  await rename(temp, file)
+  const temp = `${file}.${randomUUID()}.tmp`
+  try {
+    await writeFile(temp, `${JSON.stringify(valid, null, 2)}\n`, { mode: 0o600, flag: 'wx' })
+    await rename(temp, file)
+  } catch (error) {
+    await rm(temp, { force: true })
+    throw error
+  }
   return valid
 }
