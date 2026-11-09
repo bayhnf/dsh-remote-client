@@ -7,19 +7,23 @@
  * to a unix socket inside a private (0700) directory; a connection is passed on only after the
  * owner of a running tunnel routes the port to it, and refused otherwise.
  *
- * Every ssh runs with `-v` and connection sharing off, so each one authenticates on its own and
- * reports which server it reached: the endpoint and user (`Authenticating to …`) and the host key
- * ssh verified (`Server host key: …`). That identity, not the alias text, decides which browser
- * storage a server gets (see sessions.js).
+ * Every ssh reports which server it reached. ssh runs a KnownHostsCommand (which prints nothing,
+ * so host keys are still verified against known_hosts as usual) and passes it the final
+ * destination's user, host, port and host key (or host certificate) when it looks that host up by
+ * name; ProxyJump and ProxyCommand hosts are separate ssh processes and are never recorded. The
+ * record goes to a private file of this app, so nothing the server prints can change it. That
+ * identity, not the alias text, decides which browser storage a server gets (see sessions.js).
  */
 import { spawn, execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import net from 'node:net'
 
 const SSH = '/usr/bin/ssh'
 const SSH_OPTIONS = [
-  '-v', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+  '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
   '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
   // With connection sharing, ssh would reuse a master connection (no host key check of its own)
   // or hand a forward to the master and exit, so this process would no longer own it.
@@ -27,68 +31,71 @@ const SSH_OPTIONS = [
 ]
 const READY_TIMEOUT_MS = 20_000
 
-/** Collects ssh's `-v` stderr: identity lines apart, the rest (minus debug output) for errors. */
+/**
+ * A private record of the server one ssh process verified.
+ * `options` are the ssh arguments that make ssh write it; `identity()` reads it back.
+ */
+async function identityRecord() {
+  // ssh splits the KnownHostsCommand line on whitespace, so the record path must have none.
+  const base = /^[A-Za-z0-9._/-]+$/u.test(tmpdir()) ? tmpdir() : '/tmp'
+  const dir = await mkdtemp(join(base, 'dshrc-id-'))
+  const file = join(dir, 'record')
+  // ssh expands %-tokens itself and runs the command without a shell; the arguments reach
+  // /bin/sh as positional parameters, so no value is parsed as shell text. The script prints
+  // nothing (host keys come from known_hosts) and exits 0, so it never changes what ssh accepts.
+  // `%%` is ssh's escape for a literal `%`.
+  const script = 'f=$1; shift; [ "$1" = HOSTNAME ] && [ "$5" != NONE ] && printf "%%s\\n" "$*" >> "$f"; exit 0'
+  return {
+    options: ['-o', `KnownHostsCommand=/bin/sh -c '${script}' dshrc ${file} %I %r %h %p %t %f %K`],
+    /** @returns {Promise<string>} digest of user@host:port + key, or '' when ssh verified none. */
+    async identity() {
+      const text = await readFile(file, 'utf8').catch(() => '')
+      const lines = [...new Set(text.split('\n').filter(Boolean))]
+      // One lookup by name per connection; more than one distinct target is never trusted.
+      if (lines.length !== 1) return ''
+      const [, user, host, port, keyType, , key] = lines[0].split(' ')
+      if (!user || !host || !port || !keyType || !key) return ''
+      return createHash('sha256').update(`${user}@${host}:${port}|${keyType} ${key}`).digest('hex')
+    },
+    dispose: () => rm(dir, { recursive: true, force: true }).catch(() => undefined),
+  }
+}
+
+/** Keeps the tail of ssh's stderr for error messages. */
 class SshOutput {
-  constructor() {
-    this.partial = ''
-    this.endpoints = new Set()
-    this.hostKeys = new Set()
-    this.messages = ''
-  }
-
+  constructor() { this.messages = '' }
   /** @param {string} chunk - next piece of stderr. */
-  push(chunk) {
-    const lines = (this.partial + chunk).split('\n')
-    this.partial = lines.pop() ?? ''
-    for (const line of lines) this.line(line.replace(/\r$/u, ''))
-  }
-
-  line(text) {
-    const endpoint = /^debug1: Authenticating to (\S+) as '([^']*)'$/u.exec(text)
-    if (endpoint !== null) { this.endpoints.add(`${endpoint[2]}@${endpoint[1]}`); return }
-    const key = /^debug1: Server host key: (\S+ \S+)$/u.exec(text)
-    if (key !== null) { this.hostKeys.add(key[1]); return }
-    if (/^(?:debug\d|OpenSSH_|Authenticated to |Transferred: |Bytes per second: )/u.test(text)) return
-    this.messages = `${this.messages}${text}\n`.slice(-4096)
-  }
-
-  /** What ssh printed that is not debug output (its error messages and the remote stderr). */
+  push(chunk) { this.messages = `${this.messages}${chunk}`.slice(-4096) }
+  /** What ssh printed (its error messages and the remote stderr). */
   get error() { return this.messages.trim() }
-
-  /**
-   * Digest of the server(s) this connection authenticated to (a ProxyJump adds the jump host);
-   * empty unless ssh reported both the endpoint and a verified host key.
-   */
-  get identity() {
-    if (this.hostKeys.size === 0 || this.endpoints.size === 0) return ''
-    const text = `${[...this.endpoints].sort().join(',')}|${[...this.hostKeys].sort().join(',')}`
-    return createHash('sha256').update(text).digest('hex')
-  }
 }
 
 /**
  * Run one command on the SSH host.
  * @param {string} sshHost - validated destination.
  * @param {string} script - remote shell line.
- * @param {{ timeoutMs?: number }} [options] - kill the command after `timeoutMs` (default 90 s).
+ * @param {{ timeoutMs?: number, signal?: AbortSignal }} [options] - kill the command after
+ *   `timeoutMs` (default 90 s), or when `signal` aborts.
  * @returns {Promise<{ out: string, identity: string }>} stdout and the identity of the server
  *   that ran it; rejects with ssh's message on failure.
  */
-export function sshRun(sshHost, script, { timeoutMs = 90_000 } = {}) {
-  return new Promise((resolve, reject) => {
-    // The script travels on stdin, so its size is not bound by the remote argv limit. It is
-    // saved to a private temp file and run with stdin closed: under `sh -s`, commands that read
-    // stdin (npm, pnpm) would swallow the rest of the script.
-    const runner = 'umask 077; f=$(mktemp) || exit 90; trap \'rm -f "$f"\' EXIT; cat >"$f"; sh "$f" </dev/null'
-    const child = execFile(SSH, [...SSH_OPTIONS, '--', sshHost, runner], { timeout: timeoutMs, maxBuffer: 4 << 20 }, (error, stdout, stderr) => {
-      const output = new SshOutput()
-      output.push(`${stderr}\n`)
-      if (error) reject(new Error(`ssh ${sshHost}: ${(output.error || error.message).slice(-2000)}`))
-      else resolve({ out: stdout, identity: output.identity })
+export async function sshRun(sshHost, script, { timeoutMs = 90_000, signal } = {}) {
+  const record = await identityRecord()
+  try {
+    const out = await new Promise((resolve, reject) => {
+      // The script travels on stdin, so its size is not bound by the remote argv limit. It is
+      // saved to a private temp file and run with stdin closed: under `sh -s`, commands that read
+      // stdin (npm, pnpm) would swallow the rest of the script.
+      const runner = 'umask 077; f=$(mktemp) || exit 90; trap \'rm -f "$f"\' EXIT; cat >"$f"; sh "$f" </dev/null'
+      const child = execFile(SSH, [...SSH_OPTIONS, ...record.options, '--', sshHost, runner], { timeout: timeoutMs, maxBuffer: 4 << 20, signal }, (error, stdout, stderr) => {
+        if (error) reject(new Error(`ssh ${sshHost}: ${(String(stderr).trim() || error.message).slice(-2000)}`))
+        else resolve(stdout)
+      })
+      child.stdin.on('error', () => { /* ssh exited early; the callback reports why */ })
+      child.stdin.end(script)
     })
-    child.stdin.on('error', () => { /* ssh exited early; the callback reports why */ })
-    child.stdin.end(script)
-  })
+    return { out, identity: await record.identity() }
+  } finally { await record.dispose() }
 }
 
 /**
@@ -133,7 +140,11 @@ export class LoopbackProxy {
           ? new Error(`port 127.0.0.1:${this.port} is in use by another program; quit it or change localPort in remote.json`)
           : error)
       })
-      this.server.listen(this.port, '127.0.0.1', resolve)
+      this.server.listen(this.port, '127.0.0.1', () => {
+        // Once bound, an accept error (such as EMFILE) concerns one connection; the port stays held.
+        this.server?.on('error', () => {})
+        resolve()
+      })
     })
     return this.ready
   }
@@ -188,13 +199,12 @@ export class Tunnel {
     this.child = undefined
     this.stopping = false
     this.output = new SshOutput()
+    this.identity = ''
+    this.record = undefined
   }
 
   /** True while this tunnel's ssh runs and it has not been stopped. */
   get alive() { return this.child !== undefined && this.child.exitCode === null && !this.stopping }
-
-  /** Digest of the server this forward authenticated to (see SshOutput.identity). */
-  get identity() { return this.output.identity }
 
   /** @returns {Promise<void>} resolves once ssh's forward accepts connections and its server is known. */
   async start() {
@@ -202,9 +212,10 @@ export class Tunnel {
     await this.proxy.listen()
     if (this.stopping) throw stoppedError()
     await rm(this.socketPath, { force: true })
-    if (this.stopping) throw stoppedError()
+    this.record = await identityRecord()
+    if (this.stopping) { await this.record.dispose(); throw stoppedError() }
     const forward = `${this.socketPath}:${this.target.host}:${this.target.port}`
-    const child = spawn(this.ssh, [...SSH_OPTIONS, '-o', 'ExitOnForwardFailure=yes', '-o', 'StreamLocalBindUnlink=yes',
+    const child = spawn(this.ssh, [...SSH_OPTIONS, ...this.record.options, '-o', 'ExitOnForwardFailure=yes', '-o', 'StreamLocalBindUnlink=yes',
       '-o', 'StreamLocalBindMask=0177', '-N', '-L', forward, '--', this.sshHost], { stdio: ['ignore', 'ignore', 'pipe'] })
     this.child = child
     child.stderr.setEncoding('utf8')
@@ -223,19 +234,22 @@ export class Tunnel {
     while (Date.now() < deadline) {
       if (this.stopping) throw stoppedError()
       if (exited) throw failure()
-      // Only this user can create the socket inside the private directory. ssh prints the server's
-      // identity before the forward listens; the pipe may still hold it, so wait for both.
-      if (await canConnectPath(this.socketPath) && this.identity !== '') {
+      // Only this user can create the socket inside the private directory. ssh verified the
+      // server's host key before the forward listens.
+      if (await canConnectPath(this.socketPath)) {
+        const identity = await this.record.identity()
         if (this.stopping) throw stoppedError()
         if (exited) throw failure()
+        if (identity === '') break
+        this.identity = identity
         ready = true
         return
       }
       await new Promise((resolve) => { setTimeout(resolve, 200) })
     }
-    const message = this.identity === '' ? 'ssh did not report a verified server host key within 20 s' : 'ssh tunnel did not open within 20 s'
+    const opened = await canConnectPath(this.socketPath)
     await this.stop()
-    throw new Error(message)
+    throw new Error(opened ? 'ssh did not report the host key it verified for this server' : 'ssh tunnel did not open within 20 s')
   }
 
   /** Send the proxy's new connections to this forward; only a started, running tunnel can be routed. */
@@ -252,7 +266,11 @@ export class Tunnel {
     if (this.child !== undefined && this.child.exitCode === null) this.child.kill('SIGTERM')
     this.child = undefined
     const socket = this.socketPath
+    const record = this.record
     return Promise.race([exited.then(() => undefined), new Promise((resolve) => { setTimeout(resolve, 3000) })])
-      .then(() => (socket === undefined ? undefined : rm(socket, { force: true }).catch(() => undefined)))
+      .then(() => Promise.all([
+        socket === undefined ? undefined : rm(socket, { force: true }).catch(() => undefined),
+        record?.dispose(),
+      ])).then(() => undefined)
   }
 }

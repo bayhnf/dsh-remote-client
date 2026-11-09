@@ -23,7 +23,7 @@ Mac: DeepSeek Harness Remote.app ──127.0.0.1:43080 ─ ssh -L <private socke
 
 1. The app reads `remote.json`, picks the active server, and over SSH starts its `dsh-server.service` if needed. It then reads the newest `dsh web: http://…/?token=…` line from the server log. A log another user could read or replace is refused.
 2. The app holds `127.0.0.1:<localPort>` itself for as long as it runs, and passes connections on to `ssh -N -L <socket>:<listener>`, whose socket sits in a private (0700) directory. No other program can take the port while the app runs.
-3. Each SSH connection reports which server it reached (the host key ssh verified, and the endpoint). Each server gets its own persistent browser session, named after that identity: cookies ignore ports, so the session is what keeps one server's login away from another. If an SSH alias or a host entry is pointed at a different machine, it opens in a new, empty session. Removing a server clears every session it used.
+3. Each SSH connection reports which server it reached: the final destination's user, address and port, with the host key ssh verified for it (a ProxyJump host never counts). Each server gets its own persistent browser session, named after that identity: cookies ignore ports, so the session is what keeps one server's login away from another. If an SSH alias or a host entry is pointed at a different machine, it opens in a new, empty session. Removing a server clears every session it used.
 4. It loads `http://127.0.0.1:<localPort>/?token=…`. The server exchanges the token for a session cookie and serves its own Web UI.
 5. If the tunnel drops, the app reconnects after 3 s, then 6 s, 12 s … up to every 60 s. Cmd+Shift+R reconnects at once.
 
@@ -82,7 +82,7 @@ Adding, removing, switching and setting up servers each ask for confirmation in 
 | Action | Effect |
 |---|---|
 | Check | Reports Node, dsh, dsh-tui, the service state, and whether the running server has the Web UI and this page enabled (read from `dsh --profile server --dump-config`) |
-| Set up server | Installs only what is missing (pinned: `@deepseek-ai/dsh@0.2.2-rc.1`, `@deepseek-harness-tui/dsh-tui@0.19.0`, `pnpm@10.33.0`); never upgrades an installed dsh or replaces an existing service, and restarts the service only when its profile changed since it started. The service log holds the launch token: it must sit in a directory only you can change (the default, `~/.dsh/logs`, is made 0700), and is kept 0600 |
+| Set up server | Installs only what is missing (pinned: `@deepseek-ai/dsh@0.2.2-rc.1`, `@deepseek-harness-tui/dsh-tui@0.19.0`, `pnpm@10.33.0`); never upgrades an installed dsh or replaces an existing service, and restarts the service only when its profile changed since it started. The service log holds the launch token: its path must have no symlinks or ACLs, and every directory on it must be one only you (or root) can change; the default, `~/.dsh/logs`, is made 0700, and the log is kept 0600 |
 | Switch | Closes the current tunnel and opens the chosen server in a new window, in that server's own session |
 | Remove | Removes the entry and clears every browser session it used, on this Mac only; nothing on the server is deleted |
 

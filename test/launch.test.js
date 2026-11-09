@@ -112,7 +112,7 @@ import { PRIVATE_LOG_FN } from '../app/lib/launch.js'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { existsSync } from 'node:fs'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { saveConfig, updateConfig, loadConfig } from '../app/lib/config.js'
 import { watchAccountSignIn } from '../app/lib/account-watch.js'
 import net from 'node:net'
@@ -266,6 +266,52 @@ test('a private directory below a sticky directory such as /tmp is accepted, and
   assert.equal(modeOf(join(outside, 'x.log')), '600')
 })
 
+test('SEC-07: a log path that goes through any symlink is refused, so the checked path is the opened path', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'dshrc-log-'))
+  // home/entry -> home/shared/middle -> home/original: the middle link sits in a directory others can write.
+  const shared = join(home, 'shared')
+  await mkdirFs(shared)
+  await chmodFs(shared, 0o777)
+  await mkdirFs(join(home, 'original'), { mode: 0o700 })
+  await symlink(join(home, 'original'), join(shared, 'middle'))
+  await symlink(join(shared, 'middle'), join(home, 'entry'))
+  assert.match(privateLog(join(home, 'entry', 'x.log'), home).err, /is a symlink/u)
+  // Even a symlink of this user's own, to a private directory, is refused.
+  await symlink(join(home, 'original'), join(home, 'own'))
+  assert.match(privateLog(join(home, 'own', 'x.log'), home).err, /is a symlink/u)
+  assert.match(privateLog(`${home}/original/../original/x.log`, home).err, /must not contain \.\./u)
+})
+
+test('SEC-07: a directory with an ACL on the log path is refused', async (t) => {
+  const python = ['/usr/bin/python3'].find(existsSync)
+  if (python === undefined) { t.skip('python3 is needed to set an ACL'); return }
+  const setAcl = (path, text) => {
+    try {
+      execFileSync(python, ['-I', '-c', 'import ctypes,ctypes.util,sys\nlib=ctypes.CDLL(ctypes.util.find_library("acl") or "libacl.so.1"); lib.acl_from_text.restype=ctypes.c_void_p\nsys.exit(lib.acl_set_file(sys.argv[1].encode(), 0x8000, ctypes.c_void_p(lib.acl_from_text(sys.argv[2].encode()))))', path, text], { stdio: 'ignore' })
+      return true
+    } catch { return false }
+  }
+  const home = await mkdtemp(join(tmpdir(), 'dshrc-log-'))
+  const parent = join(home, 'aclparent')
+  await mkdirFs(join(parent, 'logs'), { recursive: true })
+  // A named user with write access; mode bits alone show only 0770.
+  if (!setAcl(parent, 'u::rwx,u:65534:rwx,g::---,m::rwx,o::---')) { t.skip('ACLs are not supported here'); return }
+  assert.match(privateLog(join(parent, 'logs', 'x.log'), home).err, /has an ACL/u)
+  const leaf = join(home, 'aclleaf')
+  await mkdirFs(leaf, { mode: 0o700 })
+  setAcl(leaf, 'u::rwx,u:65534:rwx,g::---,m::rwx,o::---')
+  assert.match(privateLog(join(leaf, 'x.log'), home).err, /has an ACL/u)
+})
+
+test('belongsTo matches only the current names of one host id', async () => {
+  const { belongsTo, staleNames } = await import('../app/lib/sessions.js')
+  assert.equal(belongsTo('a', 'dsh-remote_a_0123456789abcdef'), true)
+  assert.equal(belongsTo('a', 'dsh-remote_ab_0123456789abcdef'), false)
+  assert.equal(belongsTo('a', 'dsh-remote-a-0123456789ab'), false, 'old names are cleared at startup, not per host')
+  assert.deepEqual(staleNames(['dsh-remote-a', 'dsh-remote-a-0123456789ab', 'dsh-remote_a_0123456789abcdef', 'dsh-remote_gone_0123456789abcdef', 'dsh-remote-pending', 'other'], ['a']),
+    ['dsh-remote-a', 'dsh-remote-a-0123456789ab', 'dsh-remote_gone_0123456789abcdef'])
+})
+
 test('a symlinked or foreign log file is refused', async () => {
   const home = await mkdtemp(join(tmpdir(), 'dshrc-log-'))
   const dir = join(home, 'logs')
@@ -295,12 +341,13 @@ async function fakeSsh(dir, mode = 'ok') {
   const path = join(dir, `fake-ssh-${mode}.mjs`)
   await writeFileFs(path, `#!${process.execPath}
 import net from 'node:net'
+import { runKnownHostsCommand } from ${JSON.stringify(new URL('./fake-ssh-knownhosts.mjs', import.meta.url).pathname)}
 const forward = process.argv[process.argv.indexOf('-L') + 1]
 const socket = forward.slice(0, forward.lastIndexOf(':', forward.lastIndexOf(':') - 1))
 const mode = ${JSON.stringify(mode)}
 if (mode === 'fail') { process.stderr.write('debug1: noise\\nbind failed\\n'); process.exit(255) }
-// What \`ssh -v\` prints before the forward listens: the server it authenticated to.
-if (mode !== 'anonymous') process.stderr.write("debug1: Authenticating to x:22 as 'me'\\ndebug1: Server host key: ssh-ed25519 SHA256:test\\n")
+// Before the forward listens, ssh looks the destination's host key up, which runs KnownHostsCommand.
+if (mode !== 'anonymous') runKnownHostsCommand(process.argv.slice(2), { user: 'me', host: 'x', port: 22, keyType: 'ssh-ed25519', key: 'AAAAtestkey' })
 const listen = () => net.createServer(c => { c.on('data', () => c.end('HTTP/1.1 200 OK\\r\\ncontent-length: 8\\r\\nconnection: close\\r\\n\\r\\nupstream')) }).listen(socket)
 // 'slow': the socket appears after 1.5 s, and SIGTERM takes 1 s to end the process.
 let server
@@ -405,11 +452,11 @@ async function fakeServer({ profile, active = false, haveDsh = true, pnpm = '10.
   if (active) await writeFileFs(unitActive, String(unitStartedAt))
   const log = join(home, '.dsh', 'logs', 'server-web.log')
   // `show -p ActiveEnterTimestamp` prints the start time as "@<epoch>", which date -d accepts.
-  await stub('systemctl', `case "$*" in *is-active*) if [ -f "${unitActive}" ]; then case "$*" in *--quiet*) ;; *) echo active;; esac; exit 0; else case "$*" in *--quiet*) ;; *) echo inactive;; esac; exit 3; fi;; *ActiveEnterTimestamp*) echo "@$(cat "${unitActive}" 2>/dev/null || echo 0)";; *enable*|*restart*|*start*) date +%s > "${unitActive}"; mkdir -p "$(dirname "${log}")"; echo "dsh web: http://127.0.0.1:3080/?token=t_\$\$" >> "${log}";; esac; exit 0`)
+  await stub('systemctl', `case "$*" in *is-active*) if [ -f "${unitActive}" ]; then case "$*" in *--quiet*) ;; *) echo active;; esac; exit 0; else case "$*" in *--quiet*) ;; *) echo inactive;; esac; exit 3; fi;; *ActiveEnterTimestamp*) echo "@$(cat "${unitActive}" 2>/dev/null || echo 0)";; *enable*|*restart*|*start*) date +%s.%N > "${unitActive}"; mkdir -p "$(dirname "${log}")"; echo "dsh web: http://127.0.0.1:3080/?token=t_\$\$" >> "${log}";; esac; exit 0`)
   await stub('loginctl', 'exit 0')
   await writeFileFs(join(home, 'dump.js'), DUMP_JS)
   if (haveDsh) {
-    await stub('dsh', `case "$*" in --version) echo 0.2.2-rc.1;; *from-default-profile*) mkdir -p "$HOME/.dsh/profiles/server"; printf '{"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app"]}}}' > "$HOME/.dsh/profiles/server/package.json";; *"plugin --profile server add"*) node -e 'const f=process.argv[1];const d=JSON.parse(require("fs").readFileSync(f));if(!d.dsh.profile.bundles.includes("dsh-remote-servers"))d.dsh.profile.bundles.push("dsh-remote-servers");require("fs").writeFileSync(f,JSON.stringify(d))' "$HOME/.dsh/profiles/server/package.json";; "--profile server --dump-config") node "${join(home, 'dump.js')}";; esac; exit 0`)
+    await stub('dsh', `case "$*" in --version) echo 0.2.2-rc.1;; *from-default-profile*) mkdir -p "$HOME/.dsh/profiles/server"; printf '{"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app"]}}}' > "$HOME/.dsh/profiles/server/package.json";; *"plugin --profile server add"*) node -e 'const f=process.argv[1];const d=JSON.parse(require("fs").readFileSync(f));if(!d.dsh.profile.bundles.includes("dsh-remote-servers"))d.dsh.profile.bundles.push("dsh-remote-servers");require("fs").writeFileSync(f,JSON.stringify(d))' "$HOME/.dsh/profiles/server/package.json";; "--profile server --dump-config") exec node "${join(home, 'dump.js')}";; esac; exit 0`)
     await stub('dsh-tui', 'exit 0')
   }
   if (pnpm !== null) await stub('pnpm', `echo ${pnpm}`)
@@ -524,6 +571,53 @@ test('D06: a disabled or skipped page, or a skipped Web UI, is not ready and set
     assert.equal(code, 18, label)
     assert.match(err, expected, label)
   }
+})
+
+test('D06: a dsh --dump-config that fails is never read as a composition', async () => {
+  // The service started after the profile was written, so only the dump decides readiness.
+  const server = await fakeServer({ profile: { 'package.json': SELECTED }, active: true, unitStartedAt: Date.now() / 1000 + 5 })
+  await mkdirFs(join(server.home, '.dsh', 'logs'), { recursive: true })
+  await writeFileFs(join(server.home, '.dsh', 'logs', 'server-web.log'), 'dsh web: http://127.0.0.1:3080/?token=t_1\n')
+  assert.equal(parseProbe(server.run(probeScript(HOST)).out).ready, true, 'control: a good dump is ready')
+  // dsh prints both entries, then fails.
+  await writeFileFs(join(server.home, 'dump.js'), `${DUMP_JS}\nprocess.exitCode = 42`)
+  const report = parseProbe(server.run(probeScript(HOST)).out)
+  assert.equal(report.ready, false)
+  assert.equal(report.plugin, false)
+  const { code, err } = server.run(setupScript(HOST, tarball))
+  assert.equal(code, 18)
+  assert.match(err, /dump-config failed/u)
+})
+
+test('Q5-3/N5-03: a profile changed in the same second the service started is still stale, and setup restarts it', async () => {
+  // Only the page is missing from what the service loaded; the manifest is newer by a fraction of
+  // a second, within the same whole second as the service start.
+  const server = await fakeServer({ profile: { 'package.json': SELECTED }, active: true })
+  const P = join(server.home, '.dsh', 'profiles', 'server', 'package.json')
+  const second = Math.floor(Date.now() / 1000) - 10
+  await writeFileFs(join(server.home, 'unit-active'), `${second}.100000`)
+  const { utimes } = await import('node:fs/promises')
+  await utimes(P, second + 0.8, second + 0.8)
+  await mkdirFs(join(server.home, '.dsh', 'logs'), { recursive: true })
+  await writeFileFs(join(server.home, '.dsh', 'logs', 'server-web.log'), 'dsh web: http://127.0.0.1:3080/?token=t_1\n')
+  const report = parseProbe(server.run(probeScript(HOST)).out)
+  assert.equal(report.stale, true)
+  assert.equal(report.ready, false)
+  const { code, out } = server.run(setupScript(HOST, tarball))
+  assert.equal(code, 0, out)
+  assert.match(out, /restart dsh-server\.service/u)
+})
+
+test('setup restarts the service after it adds the page, even when the clock says nothing changed', async () => {
+  const manifest = JSON.stringify({ dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'] } } })
+  // A service start recorded in the future: no timestamp comparison can call it stale.
+  const server = await fakeServer({ profile: { 'package.json': manifest }, active: true, unitStartedAt: Date.now() / 1000 + 3600 })
+  await mkdirFs(join(server.home, '.dsh', 'logs'), { recursive: true })
+  await writeFileFs(join(server.home, '.dsh', 'logs', 'server-web.log'), 'dsh web: http://127.0.0.1:3080/?token=t_1\n')
+  const { code, out } = server.run(setupScript(HOST, tarball))
+  assert.equal(code, 0, out)
+  assert.match(out, /add dsh-remote-servers/u)
+  assert.match(out, /restart dsh-server\.service/u)
 })
 
 test('a service started before the profile changed is not ready, and setup restarts it', async () => {
@@ -662,9 +756,48 @@ test('a forward without a verified host key is never used', { timeout: 40000 }, 
   const port = await freePort()
   const proxy = new LoopbackProxy(port)
   const tunnel = new Tunnel('x', port, { host: '127.0.0.1', port: 3080 }, () => {}, { proxy, socketPath: join(dir, 's'), ssh: await fakeSsh(dir, 'anonymous') })
-  await assert.rejects(tunnel.start(), /verified server host key/u)
+  await assert.rejects(tunnel.start(), /did not report the host key it verified/u)
   assert.equal(proxy.upstream, undefined)
   proxy.close()
+})
+
+test('SEC-01/N5-01: real OpenSSH through ProxyJump names the final server, so reversed jump roles never share an identity', { timeout: 60000 }, async (t) => {
+  if (!existsSync('/usr/sbin/sshd') || !existsSync('/usr/bin/ssh-keygen')) { t.skip('needs OpenSSH server binaries'); return }
+  const dir = await mkdtemp(join(tmpdir(), 'dshrc-sshd-'))
+  await chmodFs(dir, 0o700)
+  const keygen = (file) => execFileSync('/usr/bin/ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', file])
+  keygen(join(dir, 'client'))
+  await writeFileFs(join(dir, 'authorized_keys'), await readFileFs(join(dir, 'client.pub'), 'utf8'), { mode: 0o600 })
+  const servers = []
+  const ports = [await freePort(), await freePort()]
+  const known = []
+  for (const [index, name] of ['a', 'b'].entries()) {
+    keygen(join(dir, `${name}_host`))
+    const config = join(dir, `${name}.conf`)
+    await writeFileFs(config, [`Port ${ports[index]}`, 'ListenAddress 127.0.0.1', `HostKey ${join(dir, `${name}_host`)}`, `PidFile ${join(dir, `${name}.pid`)}`,
+      `AuthorizedKeysFile ${join(dir, 'authorized_keys')}`, 'PasswordAuthentication no', 'KbdInteractiveAuthentication no', 'UsePAM no', 'StrictModes no', 'AllowTcpForwarding yes'].join('\n'))
+    servers.push(spawn('/usr/sbin/sshd', ['-D', '-e', '-f', config], { stdio: 'ignore' }))
+    known.push(`[127.0.0.1]:${ports[index]} ${(await readFileFs(join(dir, `${name}_host.pub`), 'utf8')).split(' ').slice(0, 2).join(' ')}`)
+  }
+  try {
+    await writeFileFs(join(dir, 'known'), `${known.join('\n')}\n`)
+    const user = execFileSync('id', ['-un'], { encoding: 'utf8' }).trim()
+    const host = (alias, port, jump) => [`Host ${alias}`, '  HostName 127.0.0.1', `  Port ${port}`, `  User ${user}`, ...(jump ? [`  ProxyJump ${jump}`] : [])].join('\n')
+    await writeFileFs(join(dir, 'config'), [host('jump-a', ports[0]), host('jump-b', ports[1]), host('a-then-b', ports[1], 'jump-a'), host('b-then-a', ports[0], 'jump-b'),
+      'Host *', `  IdentityFile ${join(dir, 'client')}`, '  IdentitiesOnly yes', `  UserKnownHostsFile ${join(dir, 'known')}`, '  GlobalKnownHostsFile /dev/null', '  StrictHostKeyChecking yes'].join('\n'))
+    // The app's sshRun, with -F pointing at this fixture's configuration.
+    const source = (await readFileFs(new URL('../app/lib/tunnel.js', import.meta.url), 'utf8')).replace("'-o', 'BatchMode=yes',", `'-F', ${JSON.stringify(join(dir, 'config'))}, '-o', 'BatchMode=yes',`)
+    const { sshRun } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)
+    await new Promise(resolve => setTimeout(resolve, 500))
+    const viaA = await sshRun('a-then-b', 'true')
+    const viaB = await sshRun('b-then-a', 'true')
+    const directB = await sshRun('jump-b', 'true')
+    assert.match(viaA.identity, /^[0-9a-f]{64}$/u)
+    assert.notEqual(viaA.identity, viaB.identity, 'reversed roles are different final servers')
+    assert.equal(viaA.identity, directB.identity, 'the jump host does not enter the identity of the server behind it')
+  } finally {
+    for (const server of servers) server.kill('SIGTERM')
+  }
 })
 
 test('stop before start finishes prevents ssh from starting', { timeout: 30000 }, async () => {

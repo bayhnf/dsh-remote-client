@@ -4,59 +4,80 @@ const LAUNCH_LINE = /dsh web: (http:\/\/\S+\/\?token=[A-Za-z0-9_-]+)/gu
 
 /**
  * Shell functions that keep the server log private. `private_log` checks $L (the log, which holds
- * the reusable launch token) and $LD (its directory) and fails with a message when another user
- * could read the log or replace it before the service opens it:
+ * the reusable launch token) and fails with a message when another user could read the log, or
+ * replace it or any directory on its path before the service opens it:
  *
- * - $LD belongs to this user, is not sticky, and nobody else can write to it (not other users,
- *   and not a group with other members). It is tightened to 0700 only when it lies inside the
- *   home directory; directories elsewhere are checked, never changed.
- * - Every directory above $LD, along the path as written and after resolving symlinks, belongs to
- *   this user or root and cannot be written by anyone else. A sticky directory owned by root or
- *   this user (such as /tmp) is allowed there: others cannot rename what they do not own in it.
- * - $L is a regular file that belongs to this user (created when missing) and is set to 0600.
+ * - The path is absolute and contains no symlink in any component, so the path that is checked
+ *   is the path the service opens. (`~/` is expanded first, so a symlinked home directory is
+ *   refused too; point serverLog at the real directory.)
+ * - Every directory from / down to the log's directory belongs to this user or root, carries no
+ *   ACL (`+` in `ls -ld`), and cannot be written by anyone else: not other users, and not a group
+ *   with other members. A sticky directory owned by root or this user (such as /tmp) is allowed
+ *   above the log's directory; there others cannot rename what they do not own.
+ * - The log's own directory belongs to this user and is not sticky. Inside the home directory
+ *   it is tightened to 0700; directories elsewhere are checked, never changed.
+ * - The log is a regular file that belongs to this user (created when missing), with no ACL, and
+ *   is set to 0600.
  */
 export const PRIVATE_LOG_FN = [
-  // own_group GID: true when this user is the only possible member of the group.
+  // own_group GID: true when nobody but this user and root can be a member of the group.
   'own_group() {',
   '  og_u=$(id -un); og_m=$(getent group "$1") || return 1',
-  '  for og_x in $(printf "%s" "${og_m##*:}" | tr "," " "); do [ "$og_x" = "$og_u" ] || return 1; done',
+  '  for og_x in $(printf "%s" "${og_m##*:}" | tr "," " "); do [ "$og_x" = "$og_u" ] || [ "$og_x" = root ] || return 1; done',
   '  og_p=$(getent passwd) || return 1',
-  '  ! printf "%s\\n" "$og_p" | awk -F: -v g="$1" -v u="$og_u" \'$4 == g && $1 != u { f = 1 } END { exit !f }\'',
+  '  ! printf "%s\\n" "$og_p" | awk -F: -v g="$1" -v u="$og_u" \'$4 == g && $1 != u && $1 != "root" { f = 1 } END { exit !f }\'',
   '}',
-  // shared_dir DIR [sticky-ok]: true when someone other than this user or root can create, rename
-  // or remove entries in DIR (following symlinks).
-  'shared_dir() {',
-  '  sd_s=$(stat -L -c "%u %g %f" -- "$1") || return 0',
-  '  sd_u=${sd_s%% *}; sd_r=${sd_s#* }; sd_g=${sd_r%% *}; sd_m=$((0x${sd_r#* }))',
-  '  [ "$sd_u" = 0 ] || [ "$sd_u" = "$(id -u)" ] || return 0',
-  '  [ "${2:-}" = sticky-ok ] && [ $((sd_m & 512)) -ne 0 ] && return 1',
-  '  [ $((sd_m & 2)) -eq 0 ] || return 0',
-  '  [ $((sd_m & 16)) -eq 0 ] || own_group "$sd_g" || return 0',
+  // has_acl PATH: true when PATH has an extended ACL. getfacl answers when installed; otherwise
+  // GNU ls marks it with "+" after the mode. Without either, ACLs cannot be seen and are not refused.
+  'has_acl() {',
+  '  if command -v getfacl >/dev/null 2>&1; then getfacl -c -s -p -- "$1" 2>/dev/null | grep -q . && return 0; fi',
+  '  case "$(ls -ld -- "$1" 2>/dev/null)" in ??????????+*) return 0;; esac',
   '  return 1',
   '}',
-  // safe_above DIR: every directory above DIR is safe from other users, and no symlink along the
-  // path belongs to another user (who could point it elsewhere later).
-  'safe_above() {',
-  '  sa_d=$1',
-  '  while [ "$sa_d" != / ] && [ "$sa_d" != . ]; do',
-  '    if [ -L "$sa_d" ]; then sa_o=$(stat -c %u -- "$sa_d") || return 1; [ "$sa_o" = 0 ] || [ "$sa_o" = "$(id -u)" ] || { echo "$sa_d is a symlink that belongs to another user" >&2; return 1; }; fi',
-  '    sa_d=$(dirname "$sa_d")',
-  '    if shared_dir "$sa_d" sticky-ok; then echo "$sa_d can be changed by other users, who could replace the log; choose a serverLog under a private directory" >&2; return 1; fi',
-  '  done',
+  // safe_dir DIR WHAT: fail with a message when someone other than this user or root could
+  // create, rename or remove entries in DIR, or DIR is a symlink. WHAT is `parent` (sticky allowed)
+  // or `leaf` (must also belong to this user and not be sticky).
+  'safe_dir() {',
+  '  [ -L "$1" ] && { echo "$1 is a symlink; give serverLog a path without symlinks" >&2; return 1; }',
+  '  [ -d "$1" ] || { echo "$1 is not a directory" >&2; return 1; }',
+  '  sd_s=$(stat -c "%u %g %f" -- "$1") || return 1',
+  '  sd_u=${sd_s%% *}; sd_r=${sd_s#* }; sd_g=${sd_r%% *}; sd_m=$((0x${sd_r#* }))',
+  '  if has_acl "$1"; then echo "$1 has an ACL, so other users may be able to change it; choose a serverLog in a directory without ACLs" >&2; return 1; fi',
+  '  if [ "$2" = leaf ]; then',
+  '    [ "$sd_u" = "$(id -u)" ] || { echo "$1 must belong to $(id -un); choose a serverLog under your home" >&2; return 1; }',
+  '    [ $((sd_m & 512)) -eq 0 ] || { echo "$1 can be changed by other users; choose a serverLog under your home" >&2; return 1; }',
+  '  else',
+  '    [ "$sd_u" = 0 ] || [ "$sd_u" = "$(id -u)" ] || { echo "$1 belongs to another user, who could replace the log; choose a serverLog under a private directory" >&2; return 1; }',
+  '    [ $((sd_m & 512)) -ne 0 ] && return 0',
+  '  fi',
+  '  if [ $((sd_m & 2)) -ne 0 ] || { [ $((sd_m & 16)) -ne 0 ] && ! own_group "$sd_g"; }; then',
+  '    echo "$1 can be changed by other users, who could replace the log; choose a serverLog under a private directory" >&2; return 1',
+  '  fi',
   '}',
   'private_log() {',
-  '  pl_p=$(cd "$LD" 2>/dev/null && pwd -P) || { echo "log directory $LD does not exist" >&2; return 1; }',
-  '  pl_s=$(stat -c "%u %f" -- "$pl_p") || return 1',
-  '  pl_u=${pl_s%% *}; pl_m=$((0x${pl_s#* }))',
-  '  [ "$pl_u" = "$(id -u)" ] || { echo "log directory $pl_p must belong to $(id -un); choose a serverLog under your home" >&2; return 1; }',
+  '  case "$L" in /*) ;; *) echo "serverLog must be an absolute path" >&2; return 1;; esac',
   '  pl_h=$(cd "$HOME" 2>/dev/null && pwd -P) || pl_h=/',
-  // A directory others can change is refused, never repaired: it may be shared on purpose.
-  '  if [ $((pl_m & 512)) -ne 0 ] || shared_dir "$pl_p"; then echo "log directory $pl_p can be changed by other users; choose a serverLog under your home" >&2; return 1; fi',
-  '  if [ "$pl_h" != / ] && [ $((pl_m & 63)) -ne 0 ]; then case "$pl_p" in "$pl_h"/?*) chmod 700 "$pl_p" || return 1;; esac; fi',
-  '  safe_above "$LD" && safe_above "$pl_p" || return 1',
+  // Walk from / to the log directory, one component at a time, so no symlink goes unseen.
+  '  pl_d=""; pl_rest=${LD#/}',
+  '  safe_dir / parent || return 1',
+  '  while [ -n "$pl_rest" ]; do',
+  '    pl_c=${pl_rest%%/*}; case "$pl_rest" in */*) pl_rest=${pl_rest#*/};; *) pl_rest="";; esac',
+  '    [ "$pl_c" != .. ] || { echo "serverLog must not contain .." >&2; return 1; }',
+  '    [ -n "$pl_c" ] && [ "$pl_c" != . ] || continue',
+  '    pl_d="$pl_d/$pl_c"',
+  '    if [ -n "$pl_rest" ]; then safe_dir "$pl_d" parent || return 1; fi',
+  '  done',
+  '  [ -n "$pl_d" ] || { echo "serverLog must not be directly under /" >&2; return 1; }',
+  // The log directory: inside home it is made 0700 first (its parents were checked above), then checked.
+  '  if [ "$pl_h" != / ] && [ ! -L "$pl_d" ] && [ -d "$pl_d" ] && [ -O "$pl_d" ]; then',
+  '    case "$pl_d" in "$pl_h"/?*) pl_m=$((0x$(stat -c %f -- "$pl_d"))); if [ $((pl_m & 512)) -eq 0 ] && [ $((pl_m & 63)) -ne 0 ]; then chmod 700 "$pl_d" || return 1; fi;; esac',
+  '  fi',
+  '  safe_dir "$pl_d" leaf || return 1',
   '  if [ -L "$L" ] || { [ -e "$L" ] && { [ ! -f "$L" ] || [ ! -O "$L" ]; }; }; then echo "$L must be a regular file that belongs to $(id -un)" >&2; return 1; fi',
   '  [ -e "$L" ] || (umask 077; : >> "$L") || return 1',
-  '  chmod 600 "$L"',
+  '  chmod 600 "$L" || return 1',
+  '  if has_acl "$L"; then echo "$L has an ACL; remove it (setfacl -b), then retry" >&2; return 1; fi',
+  '  return 0',
   '}',
 ].join('\n')
 

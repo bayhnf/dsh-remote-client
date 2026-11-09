@@ -88,6 +88,7 @@ async function fakeSsh(dir) {
   await writeFile(path, `#!${process.execPath}
 import net from 'node:net'
 import { readFileSync } from 'node:fs'
+import { runKnownHostsCommand } from ${JSON.stringify(join(import.meta.dirname, 'fake-ssh-knownhosts.mjs'))}
 const args = process.argv.slice(2)
 const dest = args[args.indexOf('--') + 1]
 const host = JSON.parse(readFileSync(${JSON.stringify(join(dir, 'hosts.json'))}, 'utf8'))[dest]
@@ -95,7 +96,7 @@ const host = JSON.parse(readFileSync(${JSON.stringify(join(dir, 'hosts.json'))},
 if (args[0] === '-G') { setTimeout(() => { process.stdout.write('user me\\nhostname ' + (host?.key ?? dest) + '\\nport 22\\n'); process.exit(0) }, host?.resolveDelayMs ?? 0) }
 else {
 if (host === undefined || host.fail) { process.stderr.write((host?.fail ?? 'ssh: Could not resolve hostname') + '\\n'); process.exit(255) }
-process.stderr.write("OpenSSH_9.6p1\\ndebug1: Authenticating to " + dest + ":22 as 'me'\\ndebug1: Server host key: ssh-ed25519 " + host.key + '\\n')
+runKnownHostsCommand(args, { user: 'me', host: dest, port: 22, keyType: 'ssh-ed25519', key: host.key })
 const forward = args.indexOf('-L')
 if (forward < 0 && host.launchFail) { process.stderr.write(host.launchFail + '\\n'); process.exit(255) }
 if (forward < 0) {
@@ -304,5 +305,31 @@ test('a failed page load closes the connection and retries on its own', { timeou
     window.failLoad = undefined
     const before = t.appLoads(window).length
     await t.until(() => t.appLoads(window).length > before, 'automatic retry', 10000)
+  } finally { t.quit() }
+})
+
+test('a forward that drops while the page loads is reconnected, not left dead', { timeout: 30000 }, async () => {
+  const webA = await fakeDshWeb('A')
+  const t = await boot({ hosts: [{ id: 'a', name: 'A', sshHost: 'host-a' }], sshHosts: { 'host-a': { key: 'KEY_A', web: webA.port } } })
+  try {
+    await t.until(() => t.appLoads(t.current()).length > 0, 'first page')
+    const window = t.current()
+    // The next page load kills the forward before it finishes.
+    const load = window.loadURL.bind(window)
+    let dropped = false
+    window.loadURL = async (url) => {
+      if (!dropped && url.startsWith('http://')) {
+        dropped = true
+        execFileSync('pkill', ['-TERM', '-f', `${t.dir}/ssh.mjs .* -L `])
+        await new Promise(resolve => setTimeout(resolve, 300))
+      }
+      return load(url)
+    }
+    t.click('Reconnect')
+    await t.until(() => dropped, 'drop during load')
+    const before = t.appLoads(window).length
+    await t.until(() => t.appLoads(window).length > before + 0 && window.loads.at(-1).startsWith('http://') && t.appLoads(window).length >= 3, 'automatic reconnect', 15000)
+    const body = await fetch(`http://127.0.0.1:${t.ports[0]}/check`).then(r => r.text(), () => 'REFUSED')
+    assert.equal(body, 'A', 'the window is served again')
   } finally { t.quit() }
 })

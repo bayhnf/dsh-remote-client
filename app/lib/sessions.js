@@ -27,15 +27,15 @@ export function partitionName(hostId, identity) {
 }
 
 /**
- * Whether a partition directory (as under userData/Partitions) belongs to a host id, including
- * the names earlier versions used (dsh-remote-<id> and dsh-remote-<id>-<12 hex>).
+ * Whether a partition directory (as under userData/Partitions) belongs to a host id. Host ids
+ * have no `_`, so one id's prefix never matches another's. Names from earlier versions belong
+ * to no host: startup clears them all (staleNames).
  * @param {string} hostId - host id.
  * @param {string} name - directory name.
  * @returns {boolean} true for that host's storage.
  */
 export function belongsTo(hostId, name) {
-  if (name.startsWith(`${PREFIX}${hostId}_`)) return true
-  return name === `dsh-remote-${hostId}` || new RegExp(`^dsh-remote-${hostId}-[0-9a-f]{12}$`, 'u').test(name)
+  return name.startsWith(`${PREFIX}${hostId}_`)
 }
 
 /**
@@ -55,10 +55,17 @@ export function staleNames(names, hostIds) {
 
 /**
  * @param {string} userData - the app's userData directory.
- * @returns {Promise<string[]>} names of the partition directories on disk.
+ * @returns {Promise<string[]>} names of the partition directories on disk; [] only when there is
+ *   no Partitions directory. Any other error rejects, so nothing is reported as cleared that was
+ *   not looked at.
  */
 export async function partitionDirs(userData) {
-  return readdir(join(userData, 'Partitions')).catch(() => [])
+  try {
+    return await readdir(join(userData, 'Partitions'))
+  } catch (error) {
+    if (error?.code === 'ENOENT') return []
+    throw error
+  }
 }
 
 /**

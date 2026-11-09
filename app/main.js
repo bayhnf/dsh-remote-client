@@ -164,7 +164,7 @@ function readDeviceInfo() {
 // every await that it is still the window's own.
 
 /**
- * @typedef {{ cancelled: boolean, tunnel?: Tunnel }} Attempt
+ * @typedef {{ cancelled: boolean, abort: AbortController, tunnel?: Tunnel }} Attempt
  * @typedef {{ tunnel: Tunnel, invoke: (method: string, args?: object) => Promise<unknown>, stopWatch: (() => void) & { retry(): void } }} Live
  * @typedef {object} WindowState
  * @property {ReturnType<typeof hostById>} host - the server this window shows.
@@ -201,6 +201,7 @@ function cancelAttempt(state) {
   if (attempt === undefined) return
   state.attempt = undefined
   attempt.cancelled = true
+  attempt.abort.abort()
   void attempt.tunnel?.stop()
   attempt.tunnel = undefined
 }
@@ -218,7 +219,7 @@ function releaseWindow(state) {
 async function runAttempt(window, state, attempt) {
   const { host } = state
   const check = () => { if (attempt.cancelled || quitting || window.isDestroyed() || state.attempt !== attempt) throw new Cancelled() }
-  const launchRun = await sshRun(host.sshHost, launchScript(host))
+  const launchRun = await sshRun(host.sshHost, launchScript(host), { signal: attempt.abort.signal })
   check()
   const launch = parseLaunchUrl(launchRun.out)
   if (launch === undefined) throw new Error(`no "dsh web" launch line in ${host.serverLog} on ${host.sshHost}; use Settings → Remote servers → Set up server`)
@@ -255,6 +256,8 @@ async function runAttempt(window, state, attempt) {
   log(`connected ${host.id} (${host.sshHost}) -> ${launch.host}:${launch.port} on 127.0.0.1:${host.localPort}`)
   await window.loadURL(url).catch((error) => { if (error?.code !== 'ERR_ABORTED') throw error })
   check()
+  // A drop while the page loaded was left to this attempt (onTunnelExit saw it in flight).
+  if (state.live?.tunnel !== tunnel) throw new Error('the ssh tunnel closed while the page was loading')
 }
 
 /**
@@ -268,7 +271,7 @@ async function connectWindow(window, { automatic = false } = {}) {
   if (state === undefined || window.isDestroyed() || quitting) return 'cancelled'
   cancelAttempt(state)
   if (!automatic) state.delay = RECONNECT_DELAY_MS
-  const attempt = { cancelled: false }
+  const attempt = { cancelled: false, abort: new AbortController() }
   state.attempt = attempt
   const { host } = state
   window.setTitle(`DeepSeek Harness — ${host.name}`)
@@ -286,7 +289,13 @@ async function connectWindow(window, { automatic = false } = {}) {
     if (error instanceof IdentityChanged) {
       // Another machine answers for this host now: open it in its own session, in a new window.
       log(`${host.id}: the server's identity is new; opening it in its own session`)
-      void serialHostChange(() => replaceWindow(window, host, error.partition)).catch((failure) => { log(`opening ${host.id} failed: ${failure.message}`) })
+      const stuck = (detail) => {
+        if (window.isDestroyed() || quitting || state.attempt !== undefined) return
+        show(window, statusPage(`Cannot open ${host.name}`, `${detail}\nReconnect: Cmd+Shift+R`))
+      }
+      void serialHostChange(() => replaceWindow(window, host, error.partition)).then(
+        (replaced) => { if (!replaced) stuck('A different machine now answers for this server, and it could not be opened in its own session.') },
+        (failure) => { log(`opening ${host.id} failed: ${failure.message}`); stuck(redact(failure.message)) })
       return 'cancelled'
     }
     // A failed load leaves nothing half-open: the connection it published is closed too.
@@ -341,10 +350,11 @@ function rememberSession(hostId, partition) {
 /**
  * Replace the main window with one for `host`, keeping its position; with `partition`, that
  * session becomes the host's session first. The old window's connection is closed first.
+ * @returns {Promise<boolean>} false when the window was not replaced (gone, quitting, host removed).
  */
 async function replaceWindow(previous, host, partition) {
-  if (quitting || previous !== mainWindow || previous === undefined || previous.isDestroyed()) return
-  if (config.hosts.every(item => item.id !== host.id)) return
+  if (quitting || previous !== mainWindow || previous === undefined || previous.isDestroyed()) return false
+  if (config.hosts.every(item => item.id !== host.id)) return false
   if (partition !== undefined) rememberSession(host.id, partition)
   const bounds = previous.getBounds()
   for (const popup of popups) if (!popup.isDestroyed()) popup.close()
@@ -352,6 +362,7 @@ async function replaceWindow(previous, host, partition) {
   if (state !== undefined) releaseWindow(state)
   createWindow(host, bounds)
   previous.destroy()
+  return true
 }
 
 /** Switches, removals and session changes run one at a time. */
@@ -426,7 +437,9 @@ async function clearHostSessions(hostId) {
  * logged; such a session is never loaded, because current names include the verified identity.
  */
 async function clearStaleSessions() {
-  const stale = staleNames(await partitionDirs(app.getPath('userData')), config.hosts.map(host => host.id))
+  let names
+  try { names = await partitionDirs(app.getPath('userData')) } catch (error) { log(`listing saved sessions failed: ${error.message}`); return }
+  const stale = staleNames(names, config.hosts.map(host => host.id))
   for (const name of stale) {
     try {
       const ses = session.fromPartition(`persist:${name}`)
@@ -704,7 +717,7 @@ else {
     installIpc()
     buildMenu()
     await clearStaleSessions()
-    createWindow(activeHost())
+    if (!quitting) createWindow(activeHost())
     app.on('activate', () => {
       if (mainWindow !== undefined) mainWindow.show()
       else if (!quitting) createWindow(activeHost())

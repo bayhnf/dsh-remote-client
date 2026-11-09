@@ -25,7 +25,7 @@ const BUNDLES_FN = `bundles() { node -e 'try { const b = JSON.parse(require("fs"
  * entry (dsh-remote-servers) is. A `disabled` value other than plain `false` (such as a
  * profile-dependent expression) counts as disabled. The dump's group comments are ignored.
  */
-const COMPOSED_FN = `composed() { "$DSH" --profile server --dump-config </dev/null 2>/dev/null | awk '
+const COMPOSED_FN = `composed() { cd_dump=$("$DSH" --profile server --dump-config </dev/null 2>/dev/null) || return 1; printf '%s\\n' "$cd_dump" | awk '
 function done_entry() { if (id == "web-runtime" && name == "@deepseek-ai/dsh-web-app" && !off) web = 1; if (id == "remote-servers" && name == "dsh-remote-servers" && !off) plugin = 1 }
 function bare(text) { gsub(/^["\\047]|["\\047]$/, "", text); return text }
 /^- id: / { done_entry(); id = bare(substr($0, 7)); name = ""; off = 0; next }
@@ -50,14 +50,18 @@ const logPath = serverLog => serverLog.startsWith('~/') ? `$HOME/${serverLog.sli
 
 /**
  * Shell lines that set `stale=yes` when the active unit $U started before the profile manifest
- * $P last changed: the running service then still serves the previous composition.
+ * $P (which selects the bundles) last changed: the running service then still serves the
+ * previous composition. Patch files are not compared; dsh reloads them while it runs. When the
+ * start time cannot be read, nothing is reported stale.
  */
 const STALE_CHECK = [
   'stale=no',
   'if systemctl --user is-active --quiet "$U" && [ -f "$P" ]; then',
-  '  t=$(systemctl --user show -p ActiveEnterTimestamp --value "$U" 2>/dev/null) || t=""',
-  '  s=$(date -d "$t" +%s 2>/dev/null) || s=0',
-  '  [ "$(stat -c %Y -- "$P")" -le "$s" ] || stale=yes',
+  // Microsecond start time and nanosecond mtime, so a change in the same second still counts.
+  '  t=$(systemctl --user show -p ActiveEnterTimestamp --timestamp=us+utc --value "$U" 2>/dev/null) || t=""',
+  '  if [ -n "$t" ] && s=$(date -d "$t" +%s%N 2>/dev/null) && m=$(stat -c %.9Y -- "$P" 2>/dev/null); then',
+  '    m=$(printf %s "$m" | tr -d .); [ "$m" -le "$s" ] || stale=yes',
+  '  fi',
   'fi',
 ].join('\n')
 
@@ -76,7 +80,7 @@ export function probeScript({ serverUnit, serverLog }) {
     'unit=$(systemctl --user is-active "$U" 2>/dev/null || true); [ -n "$unit" ] || unit=unknown',
     'launch=$(grep -a -c "dsh web: http" -- "$L" 2>/dev/null); case "$launch" in ""|*[!0-9]*) launch=0;; esac',
     COMPOSED_FN,
-    'DSH=$(command -v dsh || echo false); C=$(composed)',
+    'DSH=$(command -v dsh || echo false); C=$(composed) || C=""',
     'web=no; plugin=no; case "$C" in *web*) web=yes;; esac; case "$C" in *plugin*) plugin=yes;; esac',
     STALE_CHECK,
     `printf '${REPORT}{"hostname":"%s","os":"%s","node":"%s","dsh":"%s","dshTui":"%s","unit":"%s","launchLines":%s,"plugin":"%s","web":"%s","stale":"%s"}\\n' "$(hostname | tr -cd "A-Za-z0-9._-")" "$(uname -s | tr -cd "A-Za-z0-9._-")" "$node_v" "$dsh_v" "$tui" "$(printf %s "$unit" | tr -cd "a-z-")" "$launch" "$plugin" "$web" "$stale"`,
@@ -160,12 +164,14 @@ export function setupScript({ serverUnit, serverLog, serverPort }, pluginTarball
     'elif [ -d "$D" ] && [ ! -L "$D" ] && E=$(ls -A "$D") && [ -z "$E" ]; then say "create server profile"; "$DSH" --profile server --from-default-profile web --dump-config >/dev/null',
     'elif ! bundles "$P" >/dev/null; then echo "$D exists but has no valid package.json; move it away (it is kept as is), then retry" >&2; exit 15',
     'elif ! bundles "$P" | grep -qx "@deepseek-ai/dsh-web-app"; then echo "$D does not select @deepseek-ai/dsh-web-app in dsh.profile.bundles; add it or move the profile away, then retry" >&2; exit 15; fi',
-    'case "$(composed)" in *plugin*) ;; *)',
+    'changed=no',
+    'C=$(composed) || { echo "dsh --profile server --dump-config failed; run it on the server to see why, then retry" >&2; exit 18; }',
+    'case "$C" in *plugin*) ;; *)',
     `  T="$HOME/.dsh/dsh-remote-servers.tgz"; printf %s '${pluginTarball}' | base64 -d > "$T"`,
-    '  say "add dsh-remote-servers to the server profile"; "$DSH" plugin --profile server add "$T" </dev/null >/dev/null 2>"$T.log" || { tail -n 20 "$T.log" >&2; exit 14; };;',
+    '  say "add dsh-remote-servers to the server profile"; "$DSH" plugin --profile server add "$T" </dev/null >/dev/null 2>"$T.log" || { tail -n 20 "$T.log" >&2; exit 14; }; changed=yes;;',
     'esac',
     // What the service will load must enable both the Web UI and the page, or setup stops here.
-    'C=$(composed)',
+    'C=$(composed) || { echo "dsh --profile server --dump-config failed after adding the page; run it on the server to see why, then retry" >&2; exit 18; }',
     'case "$C" in *web*) ;; *) echo "the server profile does not enable the Web UI (web-runtime); check $D/cordis.patch.yml, then retry" >&2; exit 18;; esac',
     'case "$C" in *plugin*) ;; *) echo "dsh-remote-servers is installed but not enabled in the server profile; check $D/cordis.patch.yml and dsh --profile server --dump-config, then retry" >&2; exit 18;; esac',
     'UNIT="$HOME/.config/systemd/user/$U"',
@@ -188,7 +194,7 @@ export function setupScript({ serverUnit, serverLog, serverPort }, pluginTarball
     // A running service loaded its profile when it started: restart it when the profile changed since.
     STALE_CHECK,
     'if systemctl --user is-active --quiet "$U"; then',
-    '  if [ "$stale" = no ]; then started=no; else say "restart $U to load the updated profile"; systemctl --user restart "$U"; fi',
+    '  if [ "$stale" = no ] && [ "$changed" = no ]; then started=no; else say "restart $U to load the updated profile"; systemctl --user restart "$U"; fi',
     'else systemctl --user reset-failed "$U" 2>/dev/null || true; systemctl --user enable --now "$U" >/dev/null; fi',
     // A service started or restarted here must print a new launch line and stay active; an
     // untouched running service is ready when it is active and has printed one before.
