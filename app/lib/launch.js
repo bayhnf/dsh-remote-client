@@ -40,7 +40,7 @@ export function launchScript({ serverLog, serverUnit }) {
   return [
     `L=${log}; U=${serverUnit}`,
     // The log holds the reusable launch token: keep it owner-only on every connect.
-    'chmod 700 "$(dirname "$L")" 2>/dev/null; chmod 600 "$L" 2>/dev/null',
+    'LD=$(dirname "$L"); [ -O "$LD" ] && chmod 700 "$LD" 2>/dev/null; [ -O "$L" ] && [ ! -L "$L" ] && chmod 600 "$L" 2>/dev/null',
     'if ! systemctl --user is-active --quiet "$U"; then',
     '  n=$(wc -l < "$L" 2>/dev/null || echo 0); mkdir -p "$(dirname "$L")"',
     '  systemctl --user reset-failed "$U" 2>/dev/null; systemctl --user start "$U" || exit 3',

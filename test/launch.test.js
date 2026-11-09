@@ -73,8 +73,8 @@ test('slug and nextLocalPort derive safe ids and free ports', () => {
 
 test('parseProbe reads the marked report past login-shell noise', () => {
   const out = 'welcome banner\n@@DSH-REMOTE-REPORT@@{"hostname":"gpu-box","os":"Linux","node":"v24.22.0","dsh":"","dshTui":"no","unit":"inactive","launchLines":0,"plugin":"no"}\n'
-  assert.deepEqual(parseProbe(out), { hostname: 'gpu-box', os: 'Linux', node: 'v24.22.0', dsh: '', dshTui: false, unit: 'inactive', plugin: false, ready: false })
-  const ready = '@@DSH-REMOTE-REPORT@@{"hostname":"b","os":"Linux","node":"v22","dsh":"0.2.2","dshTui":"yes","unit":"active","launchLines":3,"plugin":"yes"}'
+  assert.deepEqual(parseProbe(out), { hostname: 'gpu-box', os: 'Linux', node: 'v24.22.0', dsh: '', dshTui: false, unit: 'inactive', plugin: false, web: false, ready: false })
+  const ready = '@@DSH-REMOTE-REPORT@@{"hostname":"b","os":"Linux","node":"v22","dsh":"0.2.2","dshTui":"yes","unit":"active","launchLines":3,"plugin":"yes","web":"yes"}'
   assert.equal(parseProbe(ready).ready, true)
   assert.equal(parseProbe(ready.replace('"plugin":"yes"', '"plugin":"no"')).ready, false)
   assert.throws(() => parseProbe('nothing'), /no report/u)
@@ -211,8 +211,18 @@ test('setup gives the service a PATH with the directories of node, dsh, dsh-tui 
   assert.match(script, /Environment=PATH=%s:\/usr\/local\/bin/u)
 })
 
-test('setup tolerates a log directory it cannot chmod', () => {
-  assert.match(setupScript(HOST, 'AAAA'), /chmod 700 "\$\(dirname "\$L"\)" 2>\/dev\/null \|\| true/u)
+test('setup refuses a log directory it does not own (shared /tmp-like parent)', async () => {
+  const server = await fakeServer({})
+  // /tmp itself is not owned by this user, so a log placed directly in it must be refused.
+  const host = { ...HOST, serverLog: '/tmp/dsh-remote-shared-test.log' }
+  const { code, err } = server.run(setupScript(host, tarball))
+  assert.equal(code, 17)
+  assert.match(err, /must be a directory owned by/u)
+})
+
+test('launchScript only tightens files this user owns', () => {
+  assert.match(launchScript(HOST), /\[ -O "\$LD" \] && chmod 700/u)
+  assert.match(launchScript(HOST), /\[ -O "\$L" \] && \[ ! -L "\$L" \] && chmod 600/u)
 })
 
 // ---- tunnel: app-owned listener + private socket, with a fake ssh ----
@@ -305,7 +315,7 @@ async function fakeServer({ profile, active = false, haveDsh = true, havePnpm = 
   await stub('systemctl', `case "$*" in *is-active*) [ -f "${unitActive}" ] && exit 0 || exit 3;; *enable*|*restart*|*start*) touch "${unitActive}"; mkdir -p "$(dirname "${log}")"; echo "dsh web: http://127.0.0.1:3080/?token=t_\$\$" >> "${log}";; esac; exit 0`)
   await stub('loginctl', 'exit 0')
   if (haveDsh) {
-    await stub('dsh', `case "$*" in --version) echo 0.2.2-rc.1;; *from-default-profile*) mkdir -p "$HOME/.dsh/profiles/server"; printf '{"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app"]}}}' > "$HOME/.dsh/profiles/server/package.json";; *"plugin --profile server add"*) node -e 'const f=process.argv[1];const d=JSON.parse(require("fs").readFileSync(f));d.dsh.profile.bundles.push("dsh-remote-servers");require("fs").writeFileSync(f,JSON.stringify(d))' "$HOME/.dsh/profiles/server/package.json";; esac; exit 0`)
+    await stub('dsh', `case "$*" in --version) echo 0.2.2-rc.1;; *from-default-profile*) mkdir -p "$HOME/.dsh/profiles/server"; printf '{"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app"]}}}' > "$HOME/.dsh/profiles/server/package.json";; *"plugin --profile server add"*) node -e 'const f=process.argv[1];const d=JSON.parse(require("fs").readFileSync(f));d.dsh.profile.bundles.push("dsh-remote-servers");require("fs").writeFileSync(f,JSON.stringify(d))' "$HOME/.dsh/profiles/server/package.json";; "--profile server --dump-config") node -e 'try{for(const b of JSON.parse(require("fs").readFileSync(process.argv[1])).dsh.profile.bundles)console.log("# == "+b)}catch{process.exit(1)}' "$HOME/.dsh/profiles/server/package.json";; esac; exit 0`)
     await stub('dsh-tui', 'exit 0')
   }
   if (havePnpm) await stub('pnpm', 'echo 10.33.0')
@@ -392,4 +402,90 @@ test('setup without pnpm installs the pinned version and puts it on PATH', { ski
   // The fake npm installs nothing, so setup must stop with a clear message instead of continuing.
   assert.equal(code, 16)
   assert.match(err, /pnpm could not be installed/u)
+})
+
+test('setup keeps a profile directory it cannot list', async () => {
+  if (process.getuid?.() === 0) return // root can list anything
+  const server = await fakeServer({ profile: { 'cordis.patch.yml': '# user data\n' } })
+  const dir = join(server.home, '.dsh', 'profiles', 'server')
+  await chmodFs(dir, 0o300)
+  try {
+    const { code } = server.run(setupScript(HOST, tarball))
+    assert.notEqual(code, 0)
+    assert.doesNotMatch(await server.read('calls.log'), /from-default-profile/u)
+  } finally { await chmodFs(dir, 0o700) }
+})
+
+test('probe is not ready when the web app bundle is not selected', async () => {
+  const manifest = JSON.stringify({ dependencies: { '@deepseek-ai/dsh-web-app': '*' }, dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'dsh-remote-servers'] } } })
+  const server = await fakeServer({ profile: { 'package.json': manifest }, active: true })
+  await mkdirFs(join(server.home, '.dsh', 'logs'), { recursive: true })
+  await writeFileFs(join(server.home, '.dsh', 'logs', 'server-web.log'), 'dsh web: http://127.0.0.1:3080/?token=t_1\n')
+  const report = parseProbe(server.run(probeScript(HOST)).out)
+  assert.equal(report.plugin, true)
+  assert.equal(report.web, false)
+  assert.equal(report.ready, false)
+})
+
+test('a stale stop of an old tunnel never affects a newer one', { timeout: 30000 }, async () => {
+  const { Tunnel, LoopbackProxy } = await import('../app/lib/tunnel.js')
+  const dir = await mkdtemp(join(tmpdir(), 'dshrc-tun-'))
+  await chmodFs(dir, 0o700)
+  const port = await freePort()
+  const proxy = new LoopbackProxy(port)
+  const ssh = await fakeSsh(dir)
+  const older = new Tunnel('x', port, { host: '127.0.0.1', port: 3080 }, () => {}, { proxy, socketPath: join(dir, '1.s'), ssh })
+  await older.start()
+  await older.stop()
+  const newer = new Tunnel('x', port, { host: '127.0.0.1', port: 3080 }, () => {}, { proxy, socketPath: join(dir, '2.s'), ssh })
+  await newer.start()
+  await older.stop()
+  assert.equal(await fetchText(`http://127.0.0.1:${port}/`), 'upstream')
+  await newer.stop()
+  proxy.close()
+})
+
+test('stop before start finishes prevents ssh from starting', { timeout: 30000 }, async () => {
+  const { Tunnel, LoopbackProxy } = await import('../app/lib/tunnel.js')
+  const dir = await mkdtemp(join(tmpdir(), 'dshrc-tun-'))
+  const port = await freePort()
+  const proxy = new LoopbackProxy(port)
+  const tunnel = new Tunnel('x', port, { host: '127.0.0.1', port: 3080 }, () => {}, { proxy, socketPath: join(dir, 's'), ssh: await fakeSsh(dir) })
+  const starting = tunnel.start()
+  const outcome = starting.then(() => 'started', error => error.message)
+  await tunnel.stop()
+  assert.match(await outcome, /stopped before it started/u)
+  assert.equal(tunnel.child, undefined)
+  proxy.close()
+})
+
+test('a pending sign-in is dropped when the account leaves the waiting state, and retried while declined', async () => {
+  const sockets = []
+  const OriginalWS = globalThis.WebSocket
+  globalThis.WebSocket = class {
+    constructor() { this.listeners = {}; sockets.push(this) }
+    addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn) }
+    send(text) { this.streamId = JSON.parse(text).streamId }
+    close() {}
+    emit(type, event) { for (const fn of this.listeners[type] ?? []) fn(event) }
+  }
+  try {
+    let allow = false
+    const opened = []
+    const stop = watchAccountSignIn('http://127.0.0.1:1', 'c=1', { open: (url) => { if (!allow) return false; opened.push(url); return true }, theme: () => 'dark', log() {} })
+    const socket = sockets[0]
+    socket.emit('open')
+    const frame = attempt => ({ data: JSON.stringify({ streamId: socket.streamId, type: 'item', value: { attempt } }) })
+    socket.emit('message', frame({ id: 'a1', phase: 'waiting-browser', authorizeUrl: 'https://platform.deepseek.com/dsh/authorize' }))
+    socket.emit('message', frame(null))
+    allow = true
+    stop.retry()
+    assert.equal(opened.length, 0, 'a cleared attempt must not open later')
+    allow = false
+    socket.emit('message', frame({ id: 'a2', phase: 'waiting-browser', authorizeUrl: 'https://platform.deepseek.com/dsh/authorize' }))
+    allow = true
+    await new Promise(resolve => setTimeout(resolve, 2300))
+    assert.equal(opened.length, 1, 'a declined attempt is retried without a new frame')
+    stop()
+  } finally { globalThis.WebSocket = OriginalWS }
 })

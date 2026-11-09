@@ -44,8 +44,11 @@ export function probeScript({ serverUnit, serverLog }) {
     'unit=$(systemctl --user is-active "$U" 2>/dev/null || true); [ -n "$unit" ] || unit=unknown',
     'launch=$(grep -a -c "dsh web: http" -- "$L" 2>/dev/null); case "$launch" in ""|*[!0-9]*) launch=0;; esac',
     BUNDLES_FN,
-    `plugin=$(bundles "$HOME/.dsh/profiles/server/package.json" | grep -qx '${PLUGIN}' && echo yes || echo no)`,
-    `printf '${REPORT}{"hostname":"%s","os":"%s","node":"%s","dsh":"%s","dshTui":"%s","unit":"%s","launchLines":%s,"plugin":"%s"}\\n' "$(hostname)" "$(uname -s)" "$node_v" "$dsh_v" "$tui" "$unit" "$launch" "$plugin"`,
+    'SB=$(bundles "$HOME/.dsh/profiles/server/package.json")',
+    'web=$(printf "%s\\n" "$SB" | grep -qx "@deepseek-ai/dsh-web-app" && echo yes || echo no)',
+    // Selected is not enough: the composed configuration must actually contain the bundle's layer.
+    `plugin=no; if printf "%s\\n" "$SB" | grep -qx '${PLUGIN}' && command -v dsh >/dev/null && dsh --profile server --dump-config </dev/null 2>/dev/null | grep -qx '# == ${PLUGIN}'; then plugin=yes; fi`,
+    `printf '${REPORT}{"hostname":"%s","os":"%s","node":"%s","dsh":"%s","dshTui":"%s","unit":"%s","launchLines":%s,"plugin":"%s","web":"%s"}\\n' "$(hostname)" "$(uname -s)" "$node_v" "$dsh_v" "$tui" "$unit" "$launch" "$plugin" "$web"`,
   ].join('\n')
 }
 
@@ -60,10 +63,11 @@ export function parseProbe(text) {
   if (line === undefined) throw new Error('server check printed no report')
   const raw = JSON.parse(line.slice(REPORT.length))
   const plugin = raw.plugin === 'yes'
+  const web = raw.web === 'yes'
   return {
     hostname: String(raw.hostname), os: String(raw.os), node: String(raw.node), dsh: String(raw.dsh),
-    dshTui: raw.dshTui === 'yes', unit: String(raw.unit), plugin,
-    ready: raw.dsh !== '' && raw.unit === 'active' && Number(raw.launchLines) > 0 && plugin,
+    dshTui: raw.dshTui === 'yes', unit: String(raw.unit), plugin, web,
+    ready: raw.dsh !== '' && raw.unit === 'active' && Number(raw.launchLines) > 0 && plugin && web,
   }
 }
 
@@ -95,22 +99,30 @@ export function setupScript({ serverUnit, serverLog, serverPort }, pluginTarball
     '  say "enable pnpm"',
     `  PNPM_VERSION=${PINNED.pnpm.slice('pnpm@'.length)}`,
     '  if command -v corepack >/dev/null && corepack enable --install-directory "$(dirname "$DSH")" pnpm 2>/dev/null && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack prepare "pnpm@$PNPM_VERSION" --activate >/dev/null 2>&1 && [ "$(pnpm --version 2>/dev/null)" = "$PNPM_VERSION" ]; then :',
-    '  else',
+    // A failed Corepack shim must not shadow the pnpm installed below.
+    '  else corepack disable --install-directory "$(dirname "$DSH")" pnpm 2>/dev/null || true',
     '    for PP in "$(npm config get prefix)" "$HOME/.npm-global"; do',
     `      npm install -g --prefix "$PP" --no-fund --no-audit ${PINNED.pnpm} >/dev/null 2>&1 || continue`,
-    '      export PATH="$PATH:$PP/bin"; break',
+    '      export PATH="$PP/bin:$PATH"; break',
     '    done',
     '  fi',
-    '  command -v pnpm >/dev/null || { echo "pnpm could not be installed; install pnpm $PNPM_VERSION and retry" >&2; exit 16; }',
+    '  [ "$(pnpm --version 2>/dev/null)" = "$PNPM_VERSION" ] || { echo "pnpm $PNPM_VERSION could not be installed; install it and retry" >&2; exit 16; }',
     'fi',
     'export COREPACK_ENABLE_DOWNLOAD_PROMPT=0',
     // The log holds the reusable launch token: keep it owner-only.
-    `L="${logPath(serverLog)}"; umask 077; mkdir -p "$(dirname "$L")"; chmod 700 "$(dirname "$L")" 2>/dev/null || true; touch "$L"; chmod 600 "$L"`,
+    `L="${logPath(serverLog)}"; LD=$(dirname "$L"); umask 077; mkdir -p "$LD"`,
+    // The log holds the launch token. Its directory must be a real directory owned by this user
+    // and private (0700); a shared or foreign directory is refused rather than used.
+    '[ -d "$LD" ] && [ ! -L "$LD" ] && [ -O "$LD" ] && chmod 700 "$LD" || { echo "log directory $LD must be a directory owned by $(id -un) that can be made private (0700); choose a serverLog under your home" >&2; exit 17; }',
+    '[ ! -L "$L" ] || { echo "$L must not be a symlink" >&2; exit 17; }',
+    'touch "$L" && [ -O "$L" ] && chmod 600 "$L" || { echo "$L must be a file owned by $(id -un)" >&2; exit 17; }',
     BUNDLES_FN,
     'D="$HOME/.dsh/profiles/server"; P="$D/package.json"',
     // Only a missing or empty profile is created from the shipped Web template (which replaces the
     // directory). Anything else belongs to the user and is never replaced.
-    'if [ ! -e "$D" ] || [ -z "$(ls -A "$D" 2>/dev/null)" ]; then say "create server profile"; "$DSH" --profile server --from-default-profile web --dump-config >/dev/null',
+    // Create only when the directory is proven absent or listed as empty; an unlistable one is kept.
+    'if [ ! -e "$D" ] && [ ! -L "$D" ]; then say "create server profile"; "$DSH" --profile server --from-default-profile web --dump-config >/dev/null',
+    'elif [ -d "$D" ] && [ ! -L "$D" ] && E=$(ls -A "$D") && [ -z "$E" ]; then say "create server profile"; "$DSH" --profile server --from-default-profile web --dump-config >/dev/null',
     'elif ! bundles "$P" >/dev/null; then echo "$D exists but has no valid package.json; move it away (it is kept as is), then retry" >&2; exit 15',
     'elif ! bundles "$P" | grep -qx "@deepseek-ai/dsh-web-app"; then echo "$D does not select @deepseek-ai/dsh-web-app in dsh.profile.bundles; add it or move the profile away, then retry" >&2; exit 15; fi',
     'changed=no',

@@ -39,9 +39,15 @@ export function watchAccountSignIn(origin, cookie, shell) {
   let opened
   /** The newest attempt waiting for the browser that has not been opened yet. */
   let pending
+  let pendingTimer
+  /** Offer the pending sign-in; while the app declines (unfocused, throttled) try again every 2 s for up to 10 min. */
   const tryOpen = () => {
-    if (pending === undefined || opened === pending.id) return
-    if (shell.open(pending.url) === true) { opened = pending.id; pending = undefined }
+    clearTimeout(pendingTimer)
+    if (closed || pending === undefined || opened === pending.id) return
+    if (Date.now() - pending.since > 10 * 60_000) { pending = undefined; return }
+    if (shell.open(pending.url) === true) { opened = pending.id; pending = undefined; return }
+    pendingTimer = setTimeout(tryOpen, 2000)
+    pendingTimer.unref?.()
   }
   const connect = () => {
     const streamId = randomUUID()
@@ -56,13 +62,14 @@ export function watchAccountSignIn(origin, cookie, shell) {
       try { frame = JSON.parse(String(event.data)) } catch { return }
       if (frame?.streamId !== streamId || frame.type !== 'item') return
       const attempt = frame.value?.attempt
-      if (attempt?.phase !== 'waiting-browser') { if (attempt?.id === pending?.id) pending = undefined; return }
+      // Any state that is not waiting for the browser (null, signed out, finished) drops a pending page.
+      if (attempt?.phase !== 'waiting-browser') { pending = undefined; clearTimeout(pendingTimer); return }
       if (typeof attempt.authorizeUrl !== 'string' || opened === attempt.id) return
       const destination = authorizeDestination(attempt.authorizeUrl)
       if (destination === undefined) { shell.log('account: rejected authorization URL'); return }
       const target = new URL(destination)
       target.searchParams.set('theme', shell.theme())
-      pending = { id: attempt.id, url: target.href }
+      pending = { id: attempt.id, url: target.href, since: pending?.id === attempt.id ? pending.since : Date.now() }
       tryOpen()
     })
     socket.addEventListener('close', () => { if (!closed) retry = setTimeout(connect, 1000) })
@@ -74,6 +81,7 @@ export function watchAccountSignIn(origin, cookie, shell) {
     if (closed) return
     closed = true
     pending = undefined
+    clearTimeout(pendingTimer)
     clearTimeout(retry)
     try { socket?.close() } catch { /* already closing */ }
   }

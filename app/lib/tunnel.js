@@ -40,6 +40,22 @@ export function runRemote(sshHost, script, timeoutMs = 90_000) {
   })
 }
 
+/**
+ * What an SSH destination resolves to (`ssh -G`): user@hostname:port. Used to tie browser storage
+ * to the real endpoint, so retargeting an alias in ~/.ssh/config never reuses the old cookies.
+ * @param {string} sshHost - validated destination.
+ * @returns {Promise<string>} resolved endpoint, or the destination itself when ssh -G fails.
+ */
+export function resolveEndpoint(sshHost) {
+  return new Promise((resolve) => {
+    execFile(SSH, ['-G', '--', sshHost], { timeout: 10_000 }, (error, stdout) => {
+      if (error) { resolve(sshHost); return }
+      const field = name => (stdout.match(new RegExp(`^${name} (.+)$`, 'mu')) ?? [])[1] ?? ''
+      resolve(`${field('user')}@${field('hostname')}:${field('port')}`)
+    })
+  })
+}
+
 /** The app-owned listener on 127.0.0.1:<port>; it stays bound while the app runs. */
 export class LoopbackProxy {
   /** @param {number} port - loopback port the window loads. */
@@ -123,11 +139,16 @@ export class Tunnel {
     this.stderr = ''
   }
 
+  /** True while this tunnel's ssh runs and it has not been stopped. */
+  get alive() { return this.child !== undefined && this.child.exitCode === null && !this.stopping }
+
   /** @returns {Promise<void>} resolves once ssh's forward accepts connections and the proxy uses it. */
   async start() {
     if (this.proxy === undefined || this.socketPath === undefined) throw new Error('tunnel needs an app-owned proxy and a private socket path')
     await this.proxy.listen()
+    if (this.stopping) throw new Error('tunnel stopped before it started')
     await rm(this.socketPath, { force: true })
+    if (this.stopping) throw new Error('tunnel stopped before it started')
     const forward = `${this.socketPath}:${this.target.host}:${this.target.port}`
     // ControlMaster/ControlPath off: with connection sharing, ssh hands the forward to a master
     // process and exits at once, so this process would no longer own (or report on) the forward.
@@ -135,7 +156,6 @@ export class Tunnel {
       '-o', 'ExitOnForwardFailure=yes', '-o', 'StreamLocalBindUnlink=yes',
       '-o', 'StreamLocalBindMask=0177', '-N', '-L', forward, '--', this.sshHost], { stdio: ['ignore', 'ignore', 'pipe'] })
     this.child = child
-    this.stopping = false
     child.stderr.setEncoding('utf8')
     child.stderr.on('data', (chunk) => { this.stderr = (this.stderr + chunk).slice(-4096) })
     let exited = false

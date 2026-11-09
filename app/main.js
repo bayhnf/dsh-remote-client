@@ -8,13 +8,13 @@
  */
 import { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, shell, session, systemPreferences } from 'electron'
 import { join } from 'node:path'
-import { appendFile, chmod, mkdir, readFile } from 'node:fs/promises'
+import { appendFile, chmod, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { cpus, totalmem } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import { loadConfig, updateConfig, slug, nextLocalPort, HOST_DEFAULTS } from './lib/config.js'
 import { launchScript, parseLaunchUrl, localLaunchUrl, redact } from './lib/launch.js'
-import { Tunnel, LoopbackProxy, runRemote } from './lib/tunnel.js'
+import { Tunnel, LoopbackProxy, runRemote, resolveEndpoint } from './lib/tunnel.js'
 import { authenticate, hostRpc, hasConfiguredApiKey } from './lib/host-rpc.js'
 import { watchAccountSignIn } from './lib/account-watch.js'
 import { probeScript, parseProbe, setupScript } from './lib/server-setup.js'
@@ -61,13 +61,13 @@ function proxyFor(host) {
   if (proxy === undefined) { proxy = new LoopbackProxy(host.localPort); proxies.set(host.localPort, proxy) }
   return proxy
 }
-/** Private (0700) directory for the ssh forward sockets. */
-async function socketDir() {
-  const dir = join(app.getPath('userData'), 'sockets')
-  await mkdir(dir, { recursive: true, mode: 0o700 })
-  await chmod(dir, 0o700)
-  return dir
-}
+/**
+ * Private (0700, from mkdtemp) directory for the ssh forward sockets, under /tmp so every path
+ * stays far below the AF_UNIX length limit. Each attempt gets its own socket name, so cleanup of
+ * an old attempt can never touch a newer one.
+ */
+let socketRoot
+let socketCounter = 0
 /** Retire everything that holds the current server's credentials. */
 function retireSession() {
   stopAccountWatch?.()
@@ -102,8 +102,12 @@ function appOrigin() { return `http://127.0.0.1:${activeHost().localPort}` }
  * another host (in Settings or by editing remote.json) gives it a fresh, empty session.
  */
 function hostPartition(host) {
-  return `persist:dsh-remote-${host.id}-${createHash('sha256').update(host.sshHost).digest('hex').slice(0, 12)}`
+  const identity = endpoints.get(host.id) ?? host.sshHost
+  return `persist:dsh-remote-${host.id}-${createHash('sha256').update(identity).digest('hex').slice(0, 12)}`
 }
+/** Resolved endpoint (user@hostname:port) per host id, refreshed before each window is made. */
+const endpoints = new Map()
+async function refreshEndpoint(host) { endpoints.set(host.id, await resolveEndpoint(host.sshHost)) }
 const configuredSessions = new Set()
 function hostSession(host) {
   const ses = session.fromPartition(hostPartition(host))
@@ -184,37 +188,40 @@ async function connect(generation) {
   if (!current()) throw new Superseded()
   const launch = parseLaunchUrl(out)
   if (launch === undefined) throw new Error(`no "dsh web" launch line in ${host.serverLog} on ${host.sshHost}; use Settings → Remote servers → Set up server`)
+  // The old forward's credentials go before the forward itself.
+  retireSession()
   await tunnel?.stop()
   tunnel = undefined
   if (!current()) throw new Superseded()
   let started = false
-  const socketPath = join(await socketDir(), `${host.id}.sock`)
+  const socketPath = join(socketRoot, `${++socketCounter}.s`)
   const opened = new Tunnel(host.sshHost, host.localPort, launch, (code, stderr) => {
     log(`tunnel exited code=${String(code)} ${stderr}`)
     // A failed start is reported by start() itself; only a drop of the forward this window is
     // still using reconnects, and only if nothing newer has started meanwhile.
     if (!started || tunnel !== opened || generation !== connectGeneration) return
     tunnel = undefined
-    // Nothing that carries this server's cookie may outlive its tunnel.
+    // Nothing that carries this server's cookie may outlive its tunnel, and an attempt still
+    // authenticating over it is no longer current.
     retireSession()
+    connectGeneration++
     if (mainWindow !== undefined && !mainWindow.isDestroyed() && isAppUrl(mainWindow.webContents.getURL())) {
       show(mainWindow, statusPage(`Reconnecting to ${host.name}…`, ''))
     }
     void reconnect()
   }, { proxy: proxyFor(host), socketPath })
   tunnel = opened
-  try { await opened.start() } catch (error) {
-    if (tunnel === opened) tunnel = undefined
-    opened.stop()
-    throw error
-  }
+  /** This attempt still owns the window, the generation and a live forward. */
+  const alive = () => current() && tunnel === opened && opened.alive
+  try {
+  await opened.start()
   started = true
-  if (!current()) { opened.stop(); if (tunnel === opened) tunnel = undefined; throw new Superseded() }
+  if (!alive()) throw new Superseded()
   log(`connected ${host.id} (${host.sshHost}) -> ${launch.host}:${launch.port} on 127.0.0.1:${host.localPort}`)
   globalThis.__DSH_REMOTE_APP_ORIGIN__ = appOrigin()
   const url = localLaunchUrl(host.localPort, launch.token)
   const cookie = await authenticate(url)
-  if (!current()) { opened.stop(); if (tunnel === opened) tunnel = undefined; throw new Superseded() }
+  if (!alive()) throw new Superseded()
   invokeHost = hostRpc(appOrigin(), cookie)
   stopAccountWatch?.()
   stopAccountWatch = watchAccountSignIn(appOrigin(), cookie, {
@@ -229,6 +236,12 @@ async function connect(generation) {
     log,
   })
   return url
+  } catch (error) {
+    // Whatever this attempt opened is released; newer state is left alone.
+    if (tunnel === opened) { tunnel = undefined; retireSession() }
+    void opened.stop()
+    throw error
+  }
 }
 
 /** @returns {Promise<boolean>} false when the connection failed and the error page is showing. */
@@ -278,6 +291,7 @@ async function switchHostNow(id) {
   tunnel = undefined
   buildMenu()
   // The window belongs to the previous server's session; open the next one in its own.
+  await refreshEndpoint(activeHost())
   const previous = mainWindow
   for (const popup of popups) if (!popup.isDestroyed()) popup.close()
   createWindow(previous !== undefined && !previous.isDestroyed() ? previous.getBounds() : undefined)
@@ -322,7 +336,8 @@ async function reconnect() {
       await new Promise((resolve) => { setTimeout(resolve, delay) })
       // Anything newer (a switch, a manual reconnect, a closed window) takes over.
       if (quitting || generation !== connectGeneration || tunnel !== undefined || mainWindow === undefined || mainWindow.isDestroyed()) return
-      if (await openApp()) return
+      await openApp()
+      if (tunnel !== undefined) return
     }
   } finally { reconnecting = false }
 }
@@ -572,6 +587,8 @@ else {
   app.whenReady().then(async () => {
     try {
       config = await loadConfig(configFile())
+      socketRoot = await mkdtemp(join('/tmp', 'dshrc-'))
+      await chmod(socketRoot, 0o700)
       // Logs written by earlier versions were created with the default mode.
       await chmod(logFile(), 0o600).catch(() => undefined)
     } catch (error) {
@@ -586,8 +603,12 @@ else {
       () => { buildMenu() }, () => ({ revision: 0, blocked: false }))
     installIpc()
     buildMenu()
+    await refreshEndpoint(activeHost())
     createWindow()
-    app.on('activate', () => { if (mainWindow === undefined) createWindow(); else mainWindow.show() })
+    app.on('activate', () => {
+      if (mainWindow !== undefined) { mainWindow.show(); return }
+      void refreshEndpoint(activeHost()).then(() => { if (mainWindow === undefined) createWindow() })
+    })
   }).catch((error) => { dialog.showErrorBox('DeepSeek Harness Remote', String(error)); app.exit(1) })
   app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
   app.on('before-quit', () => {
@@ -596,6 +617,7 @@ else {
     retireSession()
     void tunnel?.stop()
     for (const proxy of proxies.values()) proxy.close()
+    if (socketRoot !== undefined) void rm(socketRoot, { recursive: true, force: true })
   })
   app.on('will-quit', () => { shortcuts?.dispose() })
 }
