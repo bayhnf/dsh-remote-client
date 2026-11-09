@@ -3,8 +3,16 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test test/launch.test.js",
-    "test:plugin": "node --test test/plugin.test.mjs",
+    "test": "node --test --test-concurrency=1 test/launch.test.js test/plugin.test.mjs test/main.test.mjs",
     "build:mac": "./build-mac.sh"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
+    "jsdom": "26.1.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "engines": {
+    "node": ">=22.19"
   }
 }

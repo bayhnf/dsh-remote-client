@@ -17,14 +17,17 @@ This addresses the requests in [#12670](https://github.com/deepseek-ai/deepseek-
 ## How it works
 
 ```
-Mac: DeepSeek Harness Remote.app ──ssh -L 127.0.0.1:43080──▶ server: dsh --profile server (127.0.0.1:3080)
-                                 ──ssh -L 127.0.0.1:43081──▶ second server …
+Mac: DeepSeek Harness Remote.app ──127.0.0.1:43080 ─ ssh -L <private socket> ─▶ server: dsh --profile server (127.0.0.1:3080)
+                                 ──127.0.0.1:43081 ─ ssh -L <private socket> ─▶ second server …
 ```
 
-1. The app reads `remote.json`, picks the active server, and over SSH starts its `dsh-server.service` if needed. It then reads the newest `dsh web: http://…/?token=…` line from the server log.
-2. It opens `ssh -N -L 127.0.0.1:<localPort>:<listener>`. Each server gets its own local port and its own persistent browser session, so cookies and page storage never mix (cookies ignore ports, so the session is what separates them). Removing a server clears its session.
-3. It loads `http://127.0.0.1:<localPort>/?token=…`. The server exchanges the token for a session cookie and serves its own Web UI.
-4. If the tunnel drops, the app reconnects after 3 s. Cmd+Shift+R reconnects by hand.
+1. The app reads `remote.json`, picks the active server, and over SSH starts its `dsh-server.service` if needed. It then reads the newest `dsh web: http://…/?token=…` line from the server log. A log another user could read or replace is refused.
+2. The app holds `127.0.0.1:<localPort>` itself for as long as it runs, and passes connections on to `ssh -N -L <socket>:<listener>`, whose socket sits in a private (0700) directory. No other program can take the port while the app runs.
+3. Each SSH connection reports which server it reached (the host key ssh verified, and the endpoint). Each server gets its own persistent browser session, named after that identity: cookies ignore ports, so the session is what keeps one server's login away from another. If an SSH alias or a host entry is pointed at a different machine, it opens in a new, empty session. Removing a server clears every session it used.
+4. It loads `http://127.0.0.1:<localPort>/?token=…`. The server exchanges the token for a session cookie and serves its own Web UI.
+5. If the tunnel drops, the app reconnects after 3 s, then 6 s, 12 s … up to every 60 s. Cmd+Shift+R reconnects at once.
+
+The Remote servers page can list the configured servers and run the read-only check on them over your SSH keys. Adding, switching, removing and setting up a server each need a confirmation in a native dialog, which the page cannot answer.
 
 The repository has two parts:
 
@@ -78,12 +81,12 @@ Adding, removing, switching and setting up servers each ask for confirmation in 
 
 | Action | Effect |
 |---|---|
-| Check | Reports Node, dsh, dsh-tui, the service state, and whether this page's bundle is installed |
-| Set up server | Installs only what is missing (pinned: `@deepseek-ai/dsh@0.2.2-rc.1`, `@deepseek-harness-tui/dsh-tui@0.19.0`, `pnpm@10.33.0`); never upgrades an installed dsh or replaces an existing service. The service log, which holds the launch token, is owner-only |
-| Switch | Closes the current tunnel and opens the chosen server in the same window |
-| Remove | Removes the entry from this Mac only; nothing on the server is deleted |
+| Check | Reports Node, dsh, dsh-tui, the service state, and whether the running server has the Web UI and this page enabled (read from `dsh --profile server --dump-config`) |
+| Set up server | Installs only what is missing (pinned: `@deepseek-ai/dsh@0.2.2-rc.1`, `@deepseek-harness-tui/dsh-tui@0.19.0`, `pnpm@10.33.0`); never upgrades an installed dsh or replaces an existing service, and restarts the service only when its profile changed since it started. The service log holds the launch token: it must sit in a directory only you can change (the default, `~/.dsh/logs`, is made 0700), and is kept 0600 |
+| Switch | Closes the current tunnel and opens the chosen server in a new window, in that server's own session |
+| Remove | Removes the entry and clears every browser session it used, on this Mac only; nothing on the server is deleted |
 
-Settings live in `~/Library/Application Support/DeepSeek Harness Remote/remote.json`. Every value is validated before it reaches the `ssh` command line or the remote shell, and the page can only refer to servers by id.
+Settings live in `~/Library/Application Support/DeepSeek Harness Remote/remote.json` (and `sessions.json` remembers which session each server last used). Every value is validated before it reaches the `ssh` command line or the remote shell, and the page can only refer to servers by id.
 
 ## Terminal and other clients
 
@@ -92,8 +95,7 @@ The server is a normal DSH install, so other clients use the same data. `dsh-tui
 ## Development
 
 ```sh
-npm test                                                       # node --test: config, scripts, concurrency, regressions
-NODE_PATH=<dir with jsdom, react, react-dom> npm run test:plugin   # mounts the shipped settings page with real React
+npm install && npm test        # scripts on fake servers, transport, the main-process lifecycle, and the settings page in React
 node vendor/build-desktop-keyboard.mjs <deepseek-harness checkout>   # refresh the bundled keyboard bridge
 ```
 

@@ -62,17 +62,25 @@ export function watchAccountSignIn(origin, cookie, shell) {
       try { frame = JSON.parse(String(event.data)) } catch { return }
       if (frame?.streamId !== streamId || frame.type !== 'item') return
       const attempt = frame.value?.attempt
-      // Any state that is not waiting for the browser (null, signed out, finished) drops a pending page.
-      if (attempt?.phase !== 'waiting-browser') { pending = undefined; clearTimeout(pendingTimer); return }
-      if (typeof attempt.authorizeUrl !== 'string' || opened === attempt.id) return
+      // Every snapshot replaces what was pending: only a waiting attempt with an allowed URL in this
+      // snapshot is offered, so an older page is never opened after the Host moved on.
+      const previous = pending
+      pending = undefined
+      clearTimeout(pendingTimer)
+      if (attempt?.phase !== 'waiting-browser' || typeof attempt.authorizeUrl !== 'string' || opened === attempt.id) return
       const destination = authorizeDestination(attempt.authorizeUrl)
       if (destination === undefined) { shell.log('account: rejected authorization URL'); return }
       const target = new URL(destination)
       target.searchParams.set('theme', shell.theme())
-      pending = { id: attempt.id, url: target.href, since: pending?.id === attempt.id ? pending.since : Date.now() }
+      pending = { id: attempt.id, url: target.href, since: previous?.id === attempt.id ? previous.since : Date.now() }
       tryOpen()
     })
-    socket.addEventListener('close', () => { if (!closed) retry = setTimeout(connect, 1000) })
+    socket.addEventListener('close', () => {
+      // A lost stream drops the pending page too; the next stream's first snapshot sets it again.
+      pending = undefined
+      clearTimeout(pendingTimer)
+      if (!closed) retry = setTimeout(connect, 1000)
+    })
     // An error is always followed by close, which schedules the retry; closing here would recurse.
     socket.addEventListener('error', () => {})
   }

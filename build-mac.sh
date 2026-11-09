@@ -73,9 +73,19 @@ xattr -cr "$APP"
 codesign --force --deep --sign - --timestamp=none "$APP"
 codesign --verify --deep --strict "$APP"
 
-# Replace the previous build only after this one is complete and verified.
-if [ -e "$OUT_APP" ]; then rm -rf "$OUT_APP.previous"; mv "$OUT_APP" "$OUT_APP.previous"; fi
-mv "$APP" "$OUT_APP"
-rm -rf "$OUT_APP.previous"
+# Replace the previous build only after this one is complete and verified. The previous app is
+# moved aside under a unique name and put back if the new one cannot be moved in.
+mkdir -p "$OUT_DIR"
+PREVIOUS=""
+if [ -e "$OUT_APP" ]; then
+  PREVIOUS="$(mktemp -d "$OUT_DIR/.$NAME.previous.XXXXXX")"
+  mv "$OUT_APP" "$PREVIOUS/"
+fi
+if ! mv "$APP" "$OUT_APP"; then
+  [ -z "$PREVIOUS" ] || mv "$PREVIOUS/$NAME.app" "$OUT_APP"
+  echo "build-mac.sh: could not install $OUT_APP; the previous build was kept" >&2
+  exit 1
+fi
+[ -z "$PREVIOUS" ] || rm -rf "$PREVIOUS"
 echo "built: $OUT_APP"
 echo "settings: ~/Library/Application Support/$NAME/remote.json (created on first launch)"

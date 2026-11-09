@@ -1,15 +1,18 @@
-// Mounts the shipped Settings page (plugin/lib/client.js) with real React in jsdom and drives it
-// through the same slot registration DSH uses. Needs jsdom, react and react-dom: run with
-//   NODE_PATH=<dir containing them> node --test test/plugin.test.mjs
-// (see `npm run test:plugin`). No server, SSH or Electron is involved.
+// Mounts the shipped Settings page (plugin/lib/client.js) with real React in jsdom. The bundle is
+// loaded through a ModuleLoader stand-in and applied as a plugin of a real cordis Context, the
+// framework DSH runs client plugins in; `slots` and `locale` are services that record what the
+// plugin registers, so registration and disposal are observed as DSH would see them.
+// Dependencies are this repository's devDependencies (`npm install`, then `npm test`).
+// No server, SSH or Electron is involved.
 import { test, before } from 'node:test'
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-const require = createRequire(join(process.env.NODE_PATH ?? process.cwd(), 'noop.js'))
+const require = createRequire(import.meta.url)
 const { JSDOM } = require('jsdom')
+const { Context } = await import('@deepseek-ai/cordis')
 let React, ReactDOMClient, act
 
 /** Minimal stand-ins for the shared primitives the page imports. */
@@ -33,22 +36,34 @@ function loadPlugin() {
   return { id: registered.id, exports }
 }
 
-/** Run apply() with stand-in slots/locale and return the registered component and inject face. */
-function register(exports, bridge) {
+/**
+ * Apply the bundle as a cordis plugin with recording `slots` and `locale` services.
+ * @returns {Promise<{ section, registry, dispose: () => Promise<void> }>} the registered section,
+ *   what is currently registered, and a disposer that unloads the plugin.
+ */
+async function register(exports, bridge) {
   // In Electron globalThis is the window; under Node they differ, so set the one the bundle reads.
   globalThis.dshRemote = bridge
-  let section
-  const effects = []
-  const ctx = {
-    effect: (fn) => { effects.push(fn()) },
-    locale: { register: () => () => {}, bind: () => t },
-    slots: {
-      inject: (_name, fn) => fn(),
-      register: (options, component) => { section = { options, component }; return () => {} },
+  const registry = { sections: new Map(), dictionaries: new Map(), injections: 0 }
+  const ctx = new Context()
+  ctx.provide('slots', {
+    inject: (name, fn) => {
+      registry.injections++
+      const dispose = fn()
+      return () => { registry.injections--; dispose?.() }
     },
-  }
-  exports.apply(ctx)
-  return { section, dispose: () => { for (const d of effects) if (typeof d === 'function') d() } }
+    register: (options, component) => {
+      registry.sections.set(options.id, { options, component, slot: options.name })
+      return () => { registry.sections.delete(options.id) }
+    },
+  })
+  ctx.provide('locale', {
+    register: (namespace, dictionaries) => { registry.dictionaries.set(namespace, dictionaries); return () => { registry.dictionaries.delete(namespace) } },
+    bind: () => t,
+  })
+  const fiber = ctx.plugin({ name: exports.name, inject: exports.inject, apply: exports.apply })
+  await fiber.await?.()
+  return { section: registry.sections.get('remote-servers'), registry, dispose: () => fiber.dispose() }
 }
 
 function t(key, values = {}) { return `${key}${Object.keys(values).length ? ':' + Object.values(values).join('|') : ''}` }
@@ -92,22 +107,30 @@ before(async () => {
   act = React.act
 })
 
-test('bundle registers one settings.section with plain data and callbacks', () => {
+test('bundle registers one settings.section with plain data and callbacks, and disposal removes it', async () => {
   const { id, exports } = loadPlugin()
   assert.equal(id, 'dsh-remote-servers')
   assert.deepEqual(Object.keys(exports).sort(), ['apply', 'inject', 'name'])
-  const { section } = register(exports, fakeBridge())
-  assert.equal(section.options.name, 'settings.section')
+  assert.deepEqual(exports.inject, ['slots', 'locale'])
+  const { section, registry, dispose } = await register(exports, fakeBridge())
+  assert.equal(section.slot, 'settings.section')
   assert.equal(section.options.id, 'remote-servers')
+  assert.equal(section.options.locale, 'settings.remoteServers')
+  assert.deepEqual([...registry.dictionaries.keys()], ['settings.remoteServers'])
+  for (const language of ['en', 'id', 'zh']) assert.equal(typeof registry.dictionaries.get('settings.remoteServers')[language]?.nav, 'string', language)
   const face = section.options.inject()
   assert.equal(face.managed, true)
   assert.equal(typeof face.actions.setup, 'function')
   assert.equal(face.actions === globalThis.dshRemote, false)
+  await dispose()
+  assert.equal(registry.sections.size, 0, 'the page is unregistered')
+  assert.equal(registry.dictionaries.size, 0, 'the dictionaries are unregistered')
+  assert.equal(registry.injections, 0, 'the slot injection is released')
 })
 
 test('without the desktop bridge the page shows the browser notice only', async () => {
   const { exports } = loadPlugin()
-  const { section } = register(exports, undefined)
+  const { section } = await register(exports, undefined)
   const { root, unmount } = await mount(section.component, { ...section.options.inject(), t })
   assert.match(root.textContent, /browserOnly/u)
   assert.equal(root.querySelector('button'), null)
@@ -127,7 +150,7 @@ test('setup reports done only when the follow-up check is ready', async () => {
       },
     })
     const { exports } = loadPlugin()
-    const { section } = register(exports, bridge)
+    const { section } = await register(exports, bridge)
     const { root, unmount } = await mount(section.component, { ...section.options.inject(), t })
     await settle()
     await click(button(root, 'setup'))
@@ -142,7 +165,7 @@ test('a failed list shows Retry, and Retry loads the servers', async () => {
   let attempts = 0
   const bridge = fakeBridge({ list: async () => { attempts++; if (attempts === 1) throw new Error('offline'); return HOSTS } })
   const { exports } = loadPlugin()
-  const { section } = register(exports, bridge)
+  const { section } = await register(exports, bridge)
   const { root, unmount } = await mount(section.component, { ...section.options.inject(), t })
   await settle()
   assert.match(root.textContent, /failed:offline/u)
@@ -156,7 +179,7 @@ test('a failed list shows Retry, and Retry loads the servers', async () => {
 test('a cancelled native confirmation is not reported as a failure', async () => {
   const bridge = fakeBridge({ switchTo: async () => { throw new Error("Error invoking remote method 'dsh-remote:switch': Error: cancelled") } })
   const { exports } = loadPlugin()
-  const { section } = register(exports, bridge)
+  const { section } = await register(exports, bridge)
   const { root, unmount } = await mount(section.component, { ...section.options.inject(), t })
   await settle()
   await click(button(root, 'switch'))
@@ -173,10 +196,10 @@ test('unmounting while requests are pending does not throw or warn', async () =>
   console.error = (...args) => { errors.push(args.join(' ')) }
   try {
     const { exports } = loadPlugin()
-    const { section, dispose } = register(exports, bridge)
+    const { section, dispose } = await register(exports, bridge)
     const { unmount } = await mount(section.component, { ...section.options.inject(), t })
     await unmount()
-    dispose()
+    await dispose()
     release(HOSTS)
     await settle()
   } finally { console.error = original }

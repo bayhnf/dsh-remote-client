@@ -11,10 +11,10 @@ import { join } from 'node:path'
 import { appendFile, chmod, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { cpus, totalmem } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { createHash } from 'node:crypto'
 import { loadConfig, updateConfig, slug, nextLocalPort, HOST_DEFAULTS } from './lib/config.js'
 import { launchScript, parseLaunchUrl, localLaunchUrl, redact } from './lib/launch.js'
-import { Tunnel, LoopbackProxy, runRemote, resolveEndpoint } from './lib/tunnel.js'
+import { Tunnel, LoopbackProxy, runRemote, sshRun } from './lib/tunnel.js'
+import { PENDING_PARTITION, partitionName, belongsTo, staleNames, partitionDirs, loadKnown, saveKnown } from './lib/sessions.js'
 import { authenticate, hostRpc, hasConfiguredApiKey } from './lib/host-rpc.js'
 import { watchAccountSignIn } from './lib/account-watch.js'
 import { probeScript, parseProbe, setupScript } from './lib/server-setup.js'
@@ -44,13 +44,8 @@ app.setName('DeepSeek Harness Remote')
 app.setPath('userData', join(app.getPath('appData'), 'DeepSeek Harness Remote'))
 
 let config
-let tunnel
 let mainWindow
 let shortcuts
-let invokeHost
-let stopAccountWatch
-/** Bumped by every openApp(); an older in-flight connect sees the change and stops. */
-let connectGeneration = 0
 let lastSignInOpen = 0
 /** Sign-in popups of the current window; closed when the window changes server. */
 const popups = new Set()
@@ -68,54 +63,47 @@ function proxyFor(host) {
  */
 let socketRoot
 let socketCounter = 0
-/** Retire everything that holds the current server's credentials. */
-function retireSession() {
-  stopAccountWatch?.()
-  stopAccountWatch = undefined
-  invokeHost = undefined
-}
 let quitting = false
-let reconnecting = false
+/** host id -> persistent partition of the server it last connected to (sessions.json). */
+let knownSessions = new Map()
 
 function logFile() { return join(app.getPath('userData'), 'remote.log') }
 function configFile() { return join(app.getPath('userData'), 'remote.json') }
+function sessionsFile() { return join(app.getPath('userData'), 'sessions.json') }
 function log(message) {
   const line = `${new Date().toISOString()} ${redact(message)}\n`
   void appendFile(logFile(), line, { mode: 0o600 }).catch(() => undefined)
 }
 
-/** The host this window shows. */
+/** The host selected in remote.json. */
 function activeHost() { return config.hosts.find(host => host.id === config.activeHostId) ?? config.hosts[0] }
 function hostById(id) {
   const host = config.hosts.find(item => item.id === id)
   if (host === undefined) throw new Error(`unknown host ${String(id)}`)
   return host
 }
-/** The active server's tunnel origin. */
-function appOrigin() { return `http://127.0.0.1:${activeHost().localPort}` }
-/**
- * Each server gets its own persistent browser session: cookies ignore ports, so separate
- * loopback ports alone would send one server's auth cookie to another.
- */
-/**
- * The partition is tied to the server's SSH destination as well as its id: pointing an entry at
- * another host (in Settings or by editing remote.json) gives it a fresh, empty session.
- */
-function hostPartition(host) {
-  const identity = endpoints.get(host.id) ?? host.sshHost
-  return `persist:dsh-remote-${host.id}-${createHash('sha256').update(identity).digest('hex').slice(0, 12)}`
+/** Origin of a host's app-owned loopback port. */
+function originOf(host) { return `http://127.0.0.1:${host.localPort}` }
+
+/** The host the main window belongs to (fixed for the window's life). */
+function windowHost() { return mainWindow === undefined ? undefined : windowState.get(mainWindow)?.host }
+/** True for URLs served by the main window's server through its tunnel. */
+function isAppUrl(url) {
+  const host = windowHost()
+  if (host === undefined) return false
+  try { return new URL(url).origin === originOf(host) } catch { return false }
 }
-/** Resolved endpoint (user@hostname:port) per host id, refreshed before each window is made. */
-const endpoints = new Map()
-async function refreshEndpoint(host) { endpoints.set(host.id, await resolveEndpoint(host.sshHost)) }
+
 const configuredSessions = new Set()
-function hostSession(host) {
-  const ses = session.fromPartition(hostPartition(host))
+/**
+ * The Electron session for a partition, with the permission policy every window session gets:
+ * only the main window's top frame on the tunnel origin may ask, only for audio (dictation, and
+ * macOS still asks the user); clipboard and notifications for that same frame; nothing else.
+ */
+function sessionFor(partition) {
+  const ses = session.fromPartition(partition)
   if (!configuredSessions.has(ses)) {
     configuredSessions.add(ses)
-    // microphone-permissions.ts: only the main window's top frame on the tunnel origin may ask,
-    // only for audio (dictation), and macOS still asks the user. Other permissions are denied
-    // except clipboard and notifications for that same frame.
     const owned = (contents, frameUrl, isMainFrame) => contents != null && contents === mainWindow?.webContents && isMainFrame && isAppUrl(frameUrl)
     ses.setPermissionCheckHandler((contents, permission, origin, details) => {
       if (permission === 'media') {
@@ -154,11 +142,6 @@ function show(window, url) {
   window.loadURL(url).catch((error) => { if (error?.code !== 'ERR_ABORTED') log(`load failed: ${error.message}`) })
 }
 
-/** True for URLs served by the remote dsh through the tunnel. */
-function isAppUrl(url) {
-  try { return new URL(url).origin === appOrigin() } catch { return false }
-}
-
 /** device-info.ts: the machine description the account feedback form attaches. */
 function readDeviceInfo() {
   const fields = [`platform=${process.platform}`]
@@ -172,61 +155,93 @@ function readDeviceInfo() {
   return fields.join('; ')
 }
 
-/** Thrown when a newer connect (switch, reconnect) replaced this one while it was in flight. */
-class Superseded extends Error {}
+// ---- connections -----------------------------------------------------------------------------
+//
+// A window belongs to one host and one browser partition for its whole life. It has at most one
+// connection attempt and one live connection. An attempt owns what it opens (tunnel, account
+// watch, RPC) until it publishes them on the window or releases them; nothing else clears or
+// replaces them. Starting an attempt cancels the previous one first, and an attempt checks after
+// every await that it is still the window's own.
 
 /**
- * Resolve the active server's launch token and (re)open its forward.
- * @param {number} generation - value of connectGeneration when this attempt started; a newer
- *   attempt makes every later step of this one stop and release what it opened.
+ * @typedef {{ cancelled: boolean, tunnel?: Tunnel }} Attempt
+ * @typedef {{ tunnel: Tunnel, invoke: (method: string, args?: object) => Promise<unknown>, stopWatch: (() => void) & { retry(): void } }} Live
+ * @typedef {object} WindowState
+ * @property {ReturnType<typeof hostById>} host - the server this window shows.
+ * @property {string} partition - the window's session partition.
+ * @property {Attempt | undefined} attempt - the connection attempt in progress.
+ * @property {Live | undefined} live - the connection in use.
+ * @property {number} delay - next automatic reconnect delay (ms).
+ * @property {NodeJS.Timeout | undefined} retryTimer - pending automatic reconnect.
  */
-async function connect(generation) {
-  const owner = mainWindow
-  const current = () => generation === connectGeneration && !quitting && owner === mainWindow && owner !== undefined && !owner.isDestroyed()
-  const host = activeHost()
-  const out = await runRemote(host.sshHost, launchScript(host))
-  if (!current()) throw new Superseded()
-  const launch = parseLaunchUrl(out)
+/** @type {WeakMap<Electron.BrowserWindow, WindowState>} */
+const windowState = new WeakMap()
+
+/** Thrown inside an attempt that is no longer the window's own (newer attempt, closed window, quit). */
+class Cancelled extends Error {}
+/** Thrown when the server's verified identity does not match the window's session. */
+class IdentityChanged extends Error {
+  constructor(partition) { super('server identity changed'); this.partition = partition }
+}
+
+/** Close a published connection: account watch and RPC first, then the forward. */
+function closeLive(state) {
+  const live = state.live
+  if (live === undefined) return
+  state.live = undefined
+  live.stopWatch()
+  void live.tunnel.stop()
+}
+
+/** Cancel the window's attempt and any pending automatic reconnect. */
+function cancelAttempt(state) {
+  clearTimeout(state.retryTimer)
+  state.retryTimer = undefined
+  const attempt = state.attempt
+  if (attempt === undefined) return
+  state.attempt = undefined
+  attempt.cancelled = true
+  void attempt.tunnel?.stop()
+  attempt.tunnel = undefined
+}
+
+/** Release everything a window holds (it is closing, or the app is quitting). */
+function releaseWindow(state) {
+  cancelAttempt(state)
+  closeLive(state)
+}
+
+/**
+ * One connection attempt: the launch token over SSH, a fresh forward, the server's verified
+ * identity checked against the window's session, then authentication and the page.
+ */
+async function runAttempt(window, state, attempt) {
+  const { host } = state
+  const check = () => { if (attempt.cancelled || quitting || window.isDestroyed() || state.attempt !== attempt) throw new Cancelled() }
+  const launchRun = await sshRun(host.sshHost, launchScript(host))
+  check()
+  const launch = parseLaunchUrl(launchRun.out)
   if (launch === undefined) throw new Error(`no "dsh web" launch line in ${host.serverLog} on ${host.sshHost}; use Settings → Remote servers → Set up server`)
-  // The old forward's credentials go before the forward itself.
-  retireSession()
-  await tunnel?.stop()
-  tunnel = undefined
-  if (!current()) throw new Superseded()
-  let started = false
-  const socketPath = join(socketRoot, `${++socketCounter}.s`)
-  const opened = new Tunnel(host.sshHost, host.localPort, launch, (code, stderr) => {
-    log(`tunnel exited code=${String(code)} ${stderr}`)
-    // A failed start is reported by start() itself; only a drop of the forward this window is
-    // still using reconnects, and only if nothing newer has started meanwhile.
-    if (!started || tunnel !== opened || generation !== connectGeneration) return
-    tunnel = undefined
-    // Nothing that carries this server's cookie may outlive its tunnel, and an attempt still
-    // authenticating over it is no longer current.
-    retireSession()
-    connectGeneration++
-    if (mainWindow !== undefined && !mainWindow.isDestroyed() && isAppUrl(mainWindow.webContents.getURL())) {
-      show(mainWindow, statusPage(`Reconnecting to ${host.name}…`, ''))
-    }
-    void reconnect()
-  }, { proxy: proxyFor(host), socketPath })
-  tunnel = opened
-  /** This attempt still owns the window, the generation and a live forward. */
-  const alive = () => current() && tunnel === opened && opened.alive
-  try {
-  await opened.start()
-  started = true
-  if (!alive()) throw new Superseded()
-  log(`connected ${host.id} (${host.sshHost}) -> ${launch.host}:${launch.port} on 127.0.0.1:${host.localPort}`)
-  globalThis.__DSH_REMOTE_APP_ORIGIN__ = appOrigin()
+  const tunnel = new Tunnel(host.sshHost, host.localPort, launch, (code, stderr) => { onTunnelExit(window, state, tunnel, code, stderr) },
+    { proxy: proxyFor(host), socketPath: join(socketRoot, `${++socketCounter}.s`) })
+  attempt.tunnel = tunnel
+  await tunnel.start()
+  check()
+  // The launch token and the forward must come from the same server, and that server must be the
+  // one this window's session belongs to; otherwise the session's cookies must not reach it.
+  if (launchRun.identity === '' || tunnel.identity !== launchRun.identity) throw new Error('the two SSH connections reached different servers; check the SSH settings for this host, then reconnect')
+  const partition = partitionName(host.id, tunnel.identity)
+  if (partition !== state.partition) throw new IdentityChanged(partition)
+  // The window's previous connection goes before the new one is routed.
+  closeLive(state)
+  tunnel.route()
   const url = localLaunchUrl(host.localPort, launch.token)
   const cookie = await authenticate(url)
-  if (!alive()) throw new Superseded()
-  invokeHost = hostRpc(appOrigin(), cookie)
-  stopAccountWatch?.()
-  stopAccountWatch = watchAccountSignIn(appOrigin(), cookie, {
+  check()
+  if (!tunnel.alive) throw new Error('ssh tunnel closed while signing in')
+  const stopWatch = watchAccountSignIn(originOf(host), cookie, {
     open: (target) => {
-      if (mainWindow === undefined || mainWindow.isDestroyed() || !mainWindow.isFocused()) { log('sign-in page not opened: window not focused'); return false }
+      if (window.isDestroyed() || !window.isFocused()) { log('sign-in page not opened: window not focused'); return false }
       if (Date.now() - lastSignInOpen < 10_000) return false
       lastSignInOpen = Date.now()
       void shell.openExternal(target)
@@ -235,40 +250,111 @@ async function connect(generation) {
     theme: () => nativeTheme.shouldUseDarkColors ? 'dark' : 'light',
     log,
   })
-  return url
-  } catch (error) {
-    // Whatever this attempt opened is released; newer state is left alone.
-    if (tunnel === opened) { tunnel = undefined; retireSession() }
-    void opened.stop()
-    throw error
-  }
+  state.live = { tunnel, invoke: hostRpc(originOf(host), cookie), stopWatch }
+  attempt.tunnel = undefined
+  log(`connected ${host.id} (${host.sshHost}) -> ${launch.host}:${launch.port} on 127.0.0.1:${host.localPort}`)
+  await window.loadURL(url).catch((error) => { if (error?.code !== 'ERR_ABORTED') throw error })
+  check()
 }
 
-/** @returns {Promise<boolean>} false when the connection failed and the error page is showing. */
-async function openApp() {
-  if (mainWindow === undefined || mainWindow.isDestroyed()) return true
-  const generation = ++connectGeneration
-  const host = activeHost()
-  mainWindow.setTitle(`DeepSeek Harness — ${host.name}`)
-  show(mainWindow, statusPage(`Connecting to ${host.name}…`, ''))
+/**
+ * Connect a window to its host, replacing any attempt in progress.
+ * @param {Electron.BrowserWindow} window - a main window.
+ * @param {{ automatic?: boolean }} [options] - automatic reconnects back off; manual ones reset it.
+ * @returns {Promise<'connected' | 'failed' | 'cancelled'>} outcome of this attempt.
+ */
+async function connectWindow(window, { automatic = false } = {}) {
+  const state = windowState.get(window)
+  if (state === undefined || window.isDestroyed() || quitting) return 'cancelled'
+  cancelAttempt(state)
+  if (!automatic) state.delay = RECONNECT_DELAY_MS
+  const attempt = { cancelled: false }
+  state.attempt = attempt
+  const { host } = state
+  window.setTitle(`DeepSeek Harness — ${host.name}`)
+  show(window, statusPage(`Connecting to ${host.name}…`, ''))
   try {
-    const url = await connect(generation)
-    if (generation === connectGeneration && mainWindow !== undefined && !mainWindow.isDestroyed()) {
-      await mainWindow.loadURL(url).catch((error) => { if (error?.code !== 'ERR_ABORTED') throw error })
-    }
-    return true
+    await runAttempt(window, state, attempt)
+    state.attempt = undefined
+    state.delay = RECONNECT_DELAY_MS
+    return 'connected'
   } catch (error) {
-    if (error instanceof Superseded || generation !== connectGeneration) return true
+    if (state.attempt !== attempt || attempt.cancelled || error instanceof Cancelled) return 'cancelled'
+    state.attempt = undefined
+    void attempt.tunnel?.stop()
+    attempt.tunnel = undefined
+    if (error instanceof IdentityChanged) {
+      // Another machine answers for this host now: open it in its own session, in a new window.
+      log(`${host.id}: the server's identity is new; opening it in its own session`)
+      void serialHostChange(() => replaceWindow(window, host, error.partition)).catch((failure) => { log(`opening ${host.id} failed: ${failure.message}`) })
+      return 'cancelled'
+    }
+    // A failed load leaves nothing half-open: the connection it published is closed too.
+    closeLive(state)
     log(`connect failed: ${error.message}`)
     const others = config.hosts.filter(item => item.id !== host.id).map(item => item.name).join(', ')
-    show(mainWindow, statusPage(`Cannot reach DeepSeek Harness on ${host.name}`,
+    show(window, statusPage(`Cannot reach DeepSeek Harness on ${host.name}`,
       `${redact(error.message)}\n\nNot set up yet? Connection → Set up this server…\nReconnect: Cmd+Shift+R${others ? `\nSwitch server: Connection menu (${others})` : ''}\nAdd servers before any is set up: Connection → Open settings file`))
-    return false
+    scheduleReconnect(window, state)
+    return 'failed'
   }
 }
 
-/** Show another server in this window; the previous tunnel and account watch are closed first. */
-/** Switches and removals run one at a time, so a removal never targets a server being opened. */
+/** Automatic retry after a failure or a drop: 3 s, 6 s, 12 s … up to 60 s. */
+function scheduleReconnect(window, state) {
+  if (quitting || window.isDestroyed()) return
+  clearTimeout(state.retryTimer)
+  const delay = state.delay
+  state.delay = Math.min(delay * 2, 60_000)
+  state.retryTimer = setTimeout(() => {
+    state.retryTimer = undefined
+    if (state.attempt === undefined) void connectWindow(window, { automatic: true })
+  }, delay)
+}
+
+/** The forward of a window's connection dropped. */
+function onTunnelExit(window, state, tunnel, code, stderr) {
+  log(`tunnel exited code=${String(code)} ${stderr}`)
+  if (state.live?.tunnel !== tunnel) return
+  // Nothing that carries this server's cookie may outlive its forward.
+  closeLive(state)
+  if (window.isDestroyed() || quitting || state.attempt !== undefined) return
+  show(window, statusPage(`Reconnecting to ${state.host.name}…`, ''))
+  scheduleReconnect(window, state)
+}
+
+/** Manual reconnect (menu, after setup). */
+function reconnectNow() {
+  const window = mainWindow
+  if (window !== undefined && !window.isDestroyed()) void connectWindow(window)
+}
+
+// ---- windows and hosts -----------------------------------------------------------------------
+
+/** Remember (and store) the session a host connected with, so its next window opens in it. */
+function rememberSession(hostId, partition) {
+  if (knownSessions.get(hostId) === partition) return
+  knownSessions = new Map(knownSessions).set(hostId, partition)
+  void saveKnown(sessionsFile(), knownSessions).catch((error) => { log(`saving sessions.json failed: ${error.message}`) })
+}
+
+/**
+ * Replace the main window with one for `host`, keeping its position; with `partition`, that
+ * session becomes the host's session first. The old window's connection is closed first.
+ */
+async function replaceWindow(previous, host, partition) {
+  if (quitting || previous !== mainWindow || previous === undefined || previous.isDestroyed()) return
+  if (config.hosts.every(item => item.id !== host.id)) return
+  if (partition !== undefined) rememberSession(host.id, partition)
+  const bounds = previous.getBounds()
+  for (const popup of popups) if (!popup.isDestroyed()) popup.close()
+  const state = windowState.get(previous)
+  if (state !== undefined) releaseWindow(state)
+  createWindow(host, bounds)
+  previous.destroy()
+}
+
+/** Switches, removals and session changes run one at a time. */
 let hostChange = Promise.resolve()
 function serialHostChange(change) {
   const run = hostChange.then(change)
@@ -278,24 +364,17 @@ function serialHostChange(change) {
 
 function switchHost(id) { return serialHostChange(() => switchHostNow(id)) }
 
+/** Show another server: a window in that server's session replaces the current one. */
 async function switchHostNow(id) {
   hostById(id)
-  if (id === config.activeHostId && tunnel !== undefined) return
+  if (quitting) return
+  if (id === config.activeHostId && windowHost()?.id === id) return
   config = await updateConfig(configFile(), (current) => {
     if (!current.hosts.some(host => host.id === id)) throw new Error(`unknown host ${String(id)}`)
     return { ...current, activeHostId: id }
   }, () => config)
-  connectGeneration++
-  retireSession()
-  tunnel?.stop()
-  tunnel = undefined
   buildMenu()
-  // The window belongs to the previous server's session; open the next one in its own.
-  await refreshEndpoint(activeHost())
-  const previous = mainWindow
-  for (const popup of popups) if (!popup.isDestroyed()) popup.close()
-  createWindow(previous !== undefined && !previous.isDestroyed() ? previous.getBounds() : undefined)
-  if (previous !== undefined && !previous.isDestroyed()) previous.destroy()
+  await replaceWindow(mainWindow, activeHost(), undefined)
 }
 
 /**
@@ -326,26 +405,45 @@ async function confirmNative(message, detail, action) {
   return response === 0
 }
 
-async function reconnect() {
-  if (quitting || reconnecting || mainWindow === undefined || mainWindow.isDestroyed()) return
-  reconnecting = true
-  try {
-    // Back off 3 s, 6 s, 12 s … up to 60 s until a connect succeeds or something newer takes over.
-    for (let delay = RECONNECT_DELAY_MS; ; delay = Math.min(delay * 2, 60_000)) {
-      const generation = connectGeneration
-      await new Promise((resolve) => { setTimeout(resolve, delay) })
-      // Anything newer (a switch, a manual reconnect, a closed window) takes over.
-      if (quitting || generation !== connectGeneration || tunnel !== undefined || mainWindow === undefined || mainWindow.isDestroyed()) return
-      await openApp()
-      if (tunnel !== undefined) return
-    }
-  } finally { reconnecting = false }
+/**
+ * Clear every session that belongs to a host id: each server it ever reached, from any run, and
+ * the names earlier versions used.
+ */
+async function clearHostSessions(hostId) {
+  const names = new Set((await partitionDirs(app.getPath('userData'))).filter(name => belongsTo(hostId, name)))
+  const known = knownSessions.get(hostId)
+  if (known !== undefined) names.add(known.slice('persist:'.length))
+  for (const name of names) {
+    const ses = session.fromPartition(`persist:${name}`)
+    await ses.clearStorageData()
+    await ses.clearCache()
+  }
 }
 
-/** Official createWindow(): hiddenInset traffic lights inside the sidebar, sidebar vibrancy. */
-function createWindow(bounds) {
+/**
+ * At startup, clear sessions no configured host can use: those named by earlier versions (keyed by
+ * the alias, not the verified server) and those of hosts removed outside the app. A failure is
+ * logged; such a session is never loaded, because current names include the verified identity.
+ */
+async function clearStaleSessions() {
+  const stale = staleNames(await partitionDirs(app.getPath('userData')), config.hosts.map(host => host.id))
+  for (const name of stale) {
+    try {
+      const ses = session.fromPartition(`persist:${name}`)
+      await ses.clearStorageData()
+      await ses.clearCache()
+    } catch (error) { log(`clearing old session ${name} failed: ${error.message}`) }
+  }
+}
+
+/**
+ * Open the main window for `host`. A host without a verified session starts in an in-memory one
+ * that only shows status pages; its first connection then opens it in its own session.
+ */
+function createWindow(host, bounds) {
   const darwin = process.platform === 'darwin'
-  mainWindow = new BrowserWindow({
+  const partition = knownSessions.get(host.id) ?? PENDING_PARTITION
+  const window = new BrowserWindow({
     width: 1280, height: 820, ...(bounds ?? {}), minWidth: 520, minHeight: 600,
     title: 'DeepSeek Harness',
     ...(darwin ? {
@@ -358,10 +456,15 @@ function createWindow(bounds) {
     webPreferences: {
       preload: fileURLToPath(new URL('./preload.cjs', import.meta.url)),
       contextIsolation: true, sandbox: true, nodeIntegration: false, webSecurity: true,
-      session: hostSession(activeHost()),
+      session: sessionFor(partition),
     },
   })
-  const window = mainWindow
+  /** @type {WindowState} */
+  const state = { host, partition, attempt: undefined, live: undefined, delay: RECONNECT_DELAY_MS, retryTimer: undefined }
+  windowState.set(window, state)
+  mainWindow = window
+  // The bundled keyboard.ts admits IPC only from this origin (see vendor/build-desktop-keyboard.mjs).
+  globalThis.__DSH_REMOTE_APP_ORIGIN__ = originOf(host)
   const contents = window.webContents
   const sendFullscreen = () => { if (!window.isDestroyed()) contents.send(IPC.windowFullscreen, window.isFullScreen()) }
   window.on('enter-full-screen', sendFullscreen)
@@ -392,8 +495,6 @@ function createWindow(bounds) {
     event.preventDefault()
     if (/^https?:\/\//u.test(url)) void shell.openExternal(url)
   })
-  // Without a tunnel, nothing on the tunnel port belongs to the server any more.
-  contents.on('will-navigate', (event, url) => { if (isAppUrl(url) && tunnel === undefined) event.preventDefault() })
   contents.on('did-create-window', (child) => {
     // The popup is only a hand-off point for the sign-in page; never let it linger in the background.
     popups.add(child)
@@ -405,27 +506,22 @@ function createWindow(bounds) {
       child.close()
     })
   })
-  // will-navigate fires only for page-initiated navigation (status pages load through
-  // loadURL), so the remote page may navigate within the tunnel origin and nowhere else.
+  // will-navigate fires only for page-initiated navigation (status pages load through loadURL),
+  // so the remote page may navigate within its own origin while it is connected, and nowhere else.
   contents.on('will-navigate', (event, url) => {
-    if (isAppUrl(url)) return
+    if (isAppUrl(url) && state.live !== undefined) return
     event.preventDefault()
-    if (/^https?:\/\//u.test(url)) void shell.openExternal(url)
+    if (!isAppUrl(url) && /^https?:\/\//u.test(url)) void shell.openExternal(url)
   })
   shortcuts.attach(window)
   window.on('closed', () => {
-    if (mainWindow !== window) return
-    mainWindow = undefined
-    connectGeneration++
-    stopAccountWatch?.()
-    stopAccountWatch = undefined
-    invokeHost = undefined
-    void tunnel?.stop()
-    tunnel = undefined
+    releaseWindow(state)
+    if (mainWindow === window) mainWindow = undefined
   })
   // A sign-in the app held back while unfocused is offered when the user returns.
-  window.on('focus', () => { stopAccountWatch?.retry?.() })
-  void openApp()
+  window.on('focus', () => { state.live?.stopWatch.retry() })
+  void connectWindow(window)
+  return window
 }
 
 /** IPC sent by the preload; every handler accepts only the main window's top frame on the tunnel origin. */
@@ -439,14 +535,16 @@ function installIpc() {
   // Answered only to the main window's top frame; the preload compares it with its own origin.
   ipcMain.on('dsh-remote:active-origin', (event) => {
     const window = mainWindow
-    event.returnValue = window !== undefined && !window.isDestroyed() && event.sender === window.webContents
-      && event.senderFrame === window.webContents.mainFrame ? appOrigin() : null
+    const host = windowHost()
+    event.returnValue = window !== undefined && !window.isDestroyed() && host !== undefined && event.sender === window.webContents
+      && event.senderFrame === window.webContents.mainFrame ? originOf(host) : null
   })
   ipcMain.handle(IPC.deviceInfo, (event) => { assertOwned(event); return readDeviceInfo() })
   ipcMain.handle(IPC.onboardingApiKey, async (event) => {
     assertOwned(event)
-    if (invokeHost === undefined) return false
-    return hasConfiguredApiKey(invokeHost)
+    const live = windowState.get(mainWindow)?.live
+    if (live === undefined) return false
+    return hasConfiguredApiKey(live.invoke)
   })
   ipcMain.on(IPC.onboardingActive, (event, active) => {
     if (!owned(event) || typeof active !== 'boolean') return
@@ -464,8 +562,9 @@ function installIpc() {
   // Remote servers page. Arguments are untrusted renderer input: ids are looked up, never used
   // as paths or shell text; new hosts go through resolveConfig validation before anything runs.
   // The page is served by the connected server, so a compromised server must not be able to
-  // add hosts or install software on the user's other servers: those two actions need a native
-  // confirmation the page cannot answer.
+  // add hosts, switch, remove or install software on the user's other servers: those actions
+  // need a native confirmation the page cannot answer. Listing hosts and the read-only check
+  // (probe, over the user's SSH keys) do not.
   ipcMain.handle(IPC.remoteList, (event) => { assertOwned(event); return config })
   ipcMain.handle(IPC.remoteAdd, async (event, draft) => {
     assertOwned(event)
@@ -491,13 +590,11 @@ function installIpc() {
     if (host.id === config.activeHostId) throw new Error('switch to another server before removing this one')
     if (!await confirmNative(`Remove "${host.name}" from this app?`, `SSH host: ${host.sshHost}\nNothing on the server is deleted.`, 'Remove')) throw new Error('cancelled')
     await serialHostChange(async () => {
-      if (config.activeHostId === host.id) throw new Error('switch to another server before removing this one')
+      if (config.activeHostId === host.id || windowHost()?.id === host.id) throw new Error('switch to another server before removing this one')
       // Clear the server's cookies and storage first: if that fails, the entry stays and its id
       // cannot be reused by a new server.
       try {
-        const ses = session.fromPartition(hostPartition(host))
-        await ses.clearStorageData()
-        await ses.clearCache()
+        await clearHostSessions(host.id)
       } catch (error) {
         log(`remove ${host.id}: clearing its session failed: ${error.message}`)
         throw new Error(`could not clear this server's saved session (${error.message}); it was not removed`)
@@ -506,6 +603,10 @@ function installIpc() {
         if (current.activeHostId === host.id) throw new Error('switch to another server before removing this one')
         return { ...current, hosts: current.hosts.filter(item => item.id !== host.id) }
       }, () => config)
+      const known = new Map(knownSessions)
+      known.delete(host.id)
+      knownSessions = known
+      await saveKnown(sessionsFile(), knownSessions).catch((error) => { log(`saving sessions.json failed: ${error.message}`) })
     })
     log(`removed host ${host.id}`)
     buildMenu()
@@ -563,12 +664,12 @@ function buildMenu() {
         })),
         { type: 'separator' },
         { label: 'Set up this server…', click: () => {
-          void setupHost(config.activeHostId).then(() => openApp(), (error) => {
+          void setupHost(windowHost()?.id ?? config.activeHostId).then(() => { reconnectNow() }, (error) => {
             if (!/cancelled$/u.test(error.message)) void dialog.showMessageBox({ type: 'error', message: 'Setup failed', detail: redact(error.message).slice(-2000) })
           })
         } },
-        { label: 'Reconnect', accelerator: 'CmdOrCtrl+Shift+R', click: () => { void openApp() } },
-        { label: 'Reload page', click: () => { if (tunnel !== undefined) mainWindow?.webContents.reload() } },
+        { label: 'Reconnect', accelerator: 'CmdOrCtrl+Shift+R', click: () => { reconnectNow() } },
+        { label: 'Reload page', click: () => { if (mainWindow !== undefined && windowState.get(mainWindow)?.live !== undefined) mainWindow.webContents.reload() } },
         { type: 'separator' },
         { label: 'Open settings file', click: () => { void shell.openPath(configFile()) } },
         { label: 'Open log', click: () => { void shell.openPath(logFile()) } },
@@ -591,31 +692,29 @@ else {
       await chmod(socketRoot, 0o700)
       // Logs written by earlier versions were created with the default mode.
       await chmod(logFile(), 0o600).catch(() => undefined)
+      knownSessions = await loadKnown(sessionsFile(), config.hosts.map(host => host.id))
     } catch (error) {
       dialog.showErrorBox('DeepSeek Harness Remote', error.message)
       app.exit(1)
       return
     }
-    // The bundled keyboard.ts admits IPC only from this origin (see vendor/build-desktop-keyboard.mjs).
-    globalThis.__DSH_REMOTE_APP_ORIGIN__ = appOrigin()
     const platform = process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux'
     shortcuts = installDesktopShortcuts(() => mainWindow, app.getPath('userData'), platform,
       () => { buildMenu() }, () => ({ revision: 0, blocked: false }))
     installIpc()
     buildMenu()
-    await refreshEndpoint(activeHost())
-    createWindow()
+    await clearStaleSessions()
+    createWindow(activeHost())
     app.on('activate', () => {
-      if (mainWindow !== undefined) { mainWindow.show(); return }
-      void refreshEndpoint(activeHost()).then(() => { if (mainWindow === undefined) createWindow() })
+      if (mainWindow !== undefined) mainWindow.show()
+      else if (!quitting) createWindow(activeHost())
     })
   }).catch((error) => { dialog.showErrorBox('DeepSeek Harness Remote', String(error)); app.exit(1) })
   app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
   app.on('before-quit', () => {
     quitting = true
-    connectGeneration++
-    retireSession()
-    void tunnel?.stop()
+    const state = mainWindow === undefined ? undefined : windowState.get(mainWindow)
+    if (state !== undefined) releaseWindow(state)
     for (const proxy of proxies.values()) proxy.close()
     if (socketRoot !== undefined) void rm(socketRoot, { recursive: true, force: true })
   })
