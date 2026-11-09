@@ -350,16 +350,34 @@ test('launch refuses an unsafe log instead of reading it', async () => {
   assert.equal(code, 5)
 })
 
+/**
+ * Load app/lib/tunnel.js with every ssh call it makes (connections and `ssh -G`) reading only the
+ * given configuration file, never the test runner's ~/.ssh/config. Fails if either hook is missing.
+ */
+async function tunnelWithConfig(config) {
+  const original = await readFileFs(new URL('../app/lib/tunnel.js', import.meta.url), 'utf8')
+  const hooks = [["'-o', 'BatchMode=yes',", `'-F', ${JSON.stringify(config)}, '-o', 'BatchMode=yes',`], ["execFile(ssh, ['-G', '--', sshHost]", `execFile(ssh, ['-F', ${JSON.stringify(config)}, '-G', '--', sshHost]`]]
+  let source = original
+  for (const [from, to] of hooks) {
+    assert.equal(source.split(from).length, 2, `tunnel.js has exactly one ${from}`)
+    source = source.replace(from, to)
+  }
+  return import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)
+}
+
 // ---- tunnel: app-owned listener + private socket, with a fake ssh ----
 /**
  * A stand-in for /usr/bin/ssh: it parses `-L <socket>:<host>:<port>`, listens on that unix
  * socket and answers every connection with a fixed HTTP response. `mode` 'fail' exits at once.
  */
-async function fakeSsh(dir, mode = 'ok') {
+async function fakeSsh(dir, mode = 'ok', { knownHostsCommand } = {}) {
   const path = join(dir, `fake-ssh-${mode}.mjs`)
   await writeFileFs(path, `#!${process.execPath}
 import net from 'node:net'
 import { runKnownHostsCommand } from ${JSON.stringify(new URL('./fake-ssh-knownhosts.mjs', import.meta.url).pathname)}
+// \`ssh -G\`: this fake's own configuration, never the user's ~/.ssh/config.
+if (process.argv[2] === '-G') { process.stdout.write('user me\\nhostname x\\nport 22\\n' + ${JSON.stringify(knownHostsCommand === undefined ? '' : `knownhostscommand ${knownHostsCommand}
+`)}); process.exit(0) }
 const forward = process.argv[process.argv.indexOf('-L') + 1]
 const socket = forward.slice(0, forward.lastIndexOf(':', forward.lastIndexOf(':') - 1))
 const mode = ${JSON.stringify(mode)}
@@ -804,8 +822,7 @@ test('SEC-01/N5-01: real OpenSSH through ProxyJump names the final server, so re
     await writeFileFs(join(dir, 'config'), [host('jump-a', ports[0]), host('jump-b', ports[1]), host('a-then-b', ports[1], 'jump-a'), host('b-then-a', ports[0], 'jump-b'),
       'Host *', `  IdentityFile ${join(dir, 'client')}`, '  IdentitiesOnly yes', `  UserKnownHostsFile ${join(dir, 'known')}`, '  GlobalKnownHostsFile /dev/null', '  StrictHostKeyChecking yes'].join('\n'))
     // The app's sshRun, with -F pointing at this fixture's configuration.
-    const source = (await readFileFs(new URL('../app/lib/tunnel.js', import.meta.url), 'utf8')).replace("'-o', 'BatchMode=yes',", `'-F', ${JSON.stringify(join(dir, 'config'))}, '-o', 'BatchMode=yes',`)
-    const { sshRun } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)
+    const { sshRun } = await tunnelWithConfig(join(dir, 'config'))
     await new Promise(resolve => setTimeout(resolve, 500))
     const viaA = await sshRun('a-then-b', 'true')
     const viaB = await sshRun('b-then-a', 'true')
@@ -837,10 +854,7 @@ test('Q6-2/N6-02: a host trusted only through the user\'s own KnownHostsCommand 
     const user = execFileSync('id', ['-un'], { encoding: 'utf8' }).trim()
     await writeFileFs(join(dir, 'config'), ['Host dynamic', '  HostName 127.0.0.1', `  Port ${port}`, `  User ${user}`, `  IdentityFile ${join(dir, 'client')}`, '  IdentitiesOnly yes',
       '  UserKnownHostsFile /dev/null', '  GlobalKnownHostsFile /dev/null', '  StrictHostKeyChecking yes', `  KnownHostsCommand ${join(dir, 'provider.sh')} %H`].join('\n'))
-    const source = (await readFileFs(new URL('../app/lib/tunnel.js', import.meta.url), 'utf8'))
-      .replace("'-o', 'BatchMode=yes',", `'-F', ${JSON.stringify(join(dir, 'config'))}, '-o', 'BatchMode=yes',`)
-      .replace("execFile(SSH, ['-G', '--', sshHost]", `execFile(SSH, ['-F', ${JSON.stringify(join(dir, 'config'))}, '-G', '--', sshHost]`)
-    const { sshRun } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)
+    const { sshRun } = await tunnelWithConfig(join(dir, 'config'))
     await new Promise(resolve => setTimeout(resolve, 500))
     const result = await sshRun('dynamic', 'echo connected')
     assert.equal(result.out.trim(), 'connected')
@@ -848,6 +862,64 @@ test('Q6-2/N6-02: a host trusted only through the user\'s own KnownHostsCommand 
     // A provider that vouches for nothing still means no trust: ssh refuses, as without the app.
     await writeFileFs(join(dir, 'provider.sh'), '#!/bin/sh\nexit 0\n', { mode: 0o700 })
     await assert.rejects(sshRun('dynamic', 'true'), /Host key verification failed/u)
+  } finally { server.kill('SIGTERM') }
+})
+
+test('N7-02: a tunnel asks its own ssh for the configuration, so the test runner\'s ~/.ssh/config never runs', { timeout: 30000 }, async () => {
+  const { Tunnel, LoopbackProxy } = await import('../app/lib/tunnel.js')
+  const dir = await mkdtemp(join(tmpdir(), 'dshrc-tun-'))
+  await chmodFs(dir, 0o700)
+  // The fake ssh reports a configured provider of its own; it must be the one that runs.
+  const marker = join(dir, 'provider-ran')
+  await writeFileFs(join(dir, 'provider.sh'), `#!/bin/sh\necho "$@" > ${JSON.stringify(marker)}\n`, { mode: 0o700 })
+  const port = await freePort()
+  const proxy = new LoopbackProxy(port)
+  const ssh = await fakeSsh(dir, 'ok', { knownHostsCommand: `${join(dir, 'provider.sh')} "%h" "%%literal"` })
+  const tunnel = new Tunnel('x', port, { host: '127.0.0.1', port: 3080 }, () => {}, { proxy, socketPath: join(dir, 's'), ssh })
+  await tunnel.start()
+  assert.equal((await readFileFs(marker, 'utf8')).trim(), 'x %literal', 'the configured provider ran with its own arguments')
+  await tunnel.stop()
+  proxy.close()
+})
+
+test('N7-01: KnownHostsCommand words are split exactly like OpenSSH argv_split, and re-quoted losslessly', async () => {
+  const { splitCommand, quoteWord } = await import('../app/lib/tunnel.js')
+  const cases = [
+    [`'can\\'t'`, ["can't"]], [`'back\\\\slash'`, ['back\\slash']], [`"a\\ b"`, ['a\\ b']], ['a b', ['a b']],
+    ['""', ['']], ['plain  words\there', ['plain', 'words', 'here']], [`"x y" 'z w'`, ['x y', 'z w']], ['a\\ b', ['a b']],
+    ['a\\qb', ['a\\qb']], [`"a'b"`, ["a'b"]], [`'a"b'`, ['a"b']], ['%%h %h', ['%%h', '%h']], ['trail\\', ['trail\\']], ['# not a comment', ['#', 'not', 'a', 'comment']],
+  ]
+  for (const [line, words] of cases) {
+    assert.deepEqual(splitCommand(line), words, line)
+    assert.deepEqual(splitCommand(words.map(quoteWord).join(' ')), words, `round trip of ${line}`)
+  }
+  assert.throws(() => splitCommand(`'open`), /invalid quotes/u)
+})
+
+test('N7-01: the user\'s KnownHostsCommand receives the same argv through the app as through plain OpenSSH', { timeout: 60000 }, async (t) => {
+  if (!existsSync('/usr/sbin/sshd') || !existsSync('/usr/bin/ssh-keygen')) { t.skip('needs OpenSSH server binaries'); return }
+  const dir = await mkdtemp(join(tmpdir(), 'dshrc-sshd-'))
+  await chmodFs(dir, 0o700)
+  execFileSync('/usr/bin/ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', join(dir, 'host')])
+  const port = await freePort()
+  await writeFileFs(join(dir, 'sshd.conf'), [`Port ${port}`, 'ListenAddress 127.0.0.1', `HostKey ${join(dir, 'host')}`, `PidFile ${join(dir, 'pid')}`, 'UsePAM no'].join('\n'))
+  const server = spawn('/usr/sbin/sshd', ['-D', '-e', '-f', join(dir, 'sshd.conf')], { stdio: 'ignore' })
+  try {
+    // The provider records its argv (NUL-separated) in the file named by its first argument.
+    await writeFileFs(join(dir, 'rec.sh'), `#!/bin/sh\nout=$1; shift\n[ "$1" = HOSTNAME ] || exit 0\nfor a in "$@"; do printf '%s\\0' "$a"; done > "$out"\n`, { mode: 0o700 })
+    const words = `HOSTNAME-%I 'can\\'t' 'back\\\\slash' "a\\ b" a b "" a\\ b a\\qb "%%h" %p`
+    const config = (out) => ['Host t', '  HostName 127.0.0.1', `  Port ${port}`, '  User nobody', '  BatchMode yes', '  UserKnownHostsFile /dev/null', '  GlobalKnownHostsFile /dev/null',
+      '  StrictHostKeyChecking yes', `  KnownHostsCommand ${join(dir, 'rec.sh')} ${out} ${words.replace('HOSTNAME-%I', '%I')}`].join('\n')
+    await writeFileFs(join(dir, 'native.conf'), config(join(dir, 'native.out')))
+    await writeFileFs(join(dir, 'app.conf'), config(join(dir, 'app.out')))
+    await new Promise(resolve => setTimeout(resolve, 500))
+    try { execFileSync('/usr/bin/ssh', ['-F', join(dir, 'native.conf'), 't', 'true'], { stdio: 'ignore' }) } catch { /* host key unknown: expected */ }
+    const { sshRun } = await tunnelWithConfig(join(dir, 'app.conf'))
+    await assert.rejects(sshRun('t', 'true'), /Host key verification failed/u)
+    const native = (await readFileFs(join(dir, 'native.out'), 'utf8')).split('\0')
+    const viaApp = (await readFileFs(join(dir, 'app.out'), 'utf8')).split('\0')
+    assert.ok(native.length > 5, 'the provider ran under plain OpenSSH')
+    assert.deepEqual(viaApp, native)
   } finally { server.kill('SIGTERM') }
 })
 

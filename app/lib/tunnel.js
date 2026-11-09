@@ -33,44 +33,62 @@ const READY_TIMEOUT_MS = 20_000
 
 /**
  * The KnownHostsCommand ssh would run for `sshHost` from the user's own configuration, as `ssh -G`
- * reports it (tokens unexpanded), or undefined when there is none.
+ * prints it (the configured text, tokens unexpanded), or undefined when there is none.
+ * @param {string} ssh - ssh binary.
  * @param {string} sshHost - validated destination.
  * @param {AbortSignal} [signal] - stop waiting.
  * @returns {Promise<string | undefined>} the configured command line.
  */
-function configuredKnownHostsCommand(sshHost, signal) {
+function configuredKnownHostsCommand(ssh, sshHost, signal) {
   return new Promise((resolve, reject) => {
-    execFile(SSH, ['-G', '--', sshHost], { timeout: 10_000, signal }, (error, stdout) => {
+    execFile(ssh, ['-G', '--', sshHost], { timeout: 10_000, signal }, (error, stdout) => {
       if (error) { reject(new Error(`ssh -G ${sshHost}: ${error.message}`)); return }
       const line = String(stdout).split('\n').find(row => row.toLowerCase().startsWith('knownhostscommand '))
-      const value = line?.slice('knownhostscommand '.length).trim()
+      const value = line?.slice('knownhostscommand '.length)
       resolve(value === undefined || value === '' || value.toLowerCase() === 'none' ? undefined : value)
     })
   })
 }
 
 /**
- * Split a KnownHostsCommand line the way ssh does before it expands tokens: on whitespace, with
- * single or double quotes grouping (argv_split in OpenSSH misc.c).
+ * Split a KnownHostsCommand line exactly as OpenSSH does before it expands tokens: argv_split()
+ * in misc.c (identical in 9.6 and 10.0), called with terminate_on_comment=0. Separators are space
+ * and tab only; `\` escapes `\`, `'` and `"` anywhere, and a space outside quotes; any other `\`
+ * is kept; quotes group. An unclosed quote is an error, as it is for ssh.
  * @param {string} text - command line.
  * @returns {string[]} words.
  */
-function splitCommand(text) {
+export function splitCommand(text) {
   const words = []
-  let word = ''
-  let quote = ''
-  let started = false
-  for (let index = 0; index < text.length; index++) {
-    const c = text[index]
-    if (quote === '' && /\s/u.test(c)) { if (started) { words.push(word); word = ''; started = false } continue }
-    started = true
-    if (c === '\\' && quote !== "'" && index + 1 < text.length && (text[index + 1] === '\\' || text[index + 1] === '"' || text[index + 1] === "'" || /\s/u.test(text[index + 1]))) { word += text[++index]; continue }
-    if (quote === '' && (c === '"' || c === "'")) { quote = c; continue }
-    if (c === quote) { quote = ''; continue }
-    word += c
+  let i = 0
+  while (i < text.length) {
+    if (text[i] === ' ' || text[i] === '\t') { i++; continue }
+    let quote = ''
+    let word = ''
+    for (; i < text.length; i++) {
+      const c = text[i]
+      const next = text[i + 1]
+      if (c === '\\') {
+        if (next === "'" || next === '"' || next === '\\' || (quote === '' && next === ' ')) { i++; word += next } else word += c
+      } else if (quote === '' && (c === ' ' || c === '\t')) break
+      else if (quote === '' && (c === '"' || c === "'")) quote = c
+      else if (quote !== '' && c === quote) quote = ''
+      else word += c
+    }
+    if (quote !== '') throw new Error('KnownHostsCommand in the SSH configuration contains invalid quotes')
+    words.push(word)
   }
-  if (started) words.push(word)
   return words
+}
+
+/**
+ * Quote one word so that splitCommand (and ssh) reads it back unchanged: inside double quotes,
+ * `\` `"` and `'` are escaped; nothing else is special there.
+ * @param {string} word - any text.
+ * @returns {string} quoted word.
+ */
+export function quoteWord(word) {
+  return `"${word.replace(/[\\"']/gu, c => `\\${c}`)}"`
 }
 
 /**
@@ -84,10 +102,12 @@ function splitCommand(text) {
  * known_hosts as usual. Nothing the server sends can reach the record.
  * `options` are the ssh arguments; `identity()` reads the record back.
  * @param {string} sshHost - validated destination.
- * @param {AbortSignal} [signal] - stop waiting.
+ * @param {{ ssh?: string, signal?: AbortSignal }} [options] - ssh binary (tests) and abort signal.
  */
-async function identityRecord(sshHost, signal) {
-  const configured = await configuredKnownHostsCommand(sshHost, signal)
+async function identityRecord(sshHost, { ssh = SSH, signal } = {}) {
+  const configured = await configuredKnownHostsCommand(ssh, sshHost, signal)
+  // Split now, so a configuration ssh itself would reject fails here with a clear message.
+  const userWords = configured === undefined ? [] : splitCommand(configured).map(quoteWord)
   // ssh splits this option on whitespace, so the record path must have none.
   const base = /^[A-Za-z0-9._/-]+$/u.test(tmpdir()) ? tmpdir() : '/tmp'
   const dir = await mkdtemp(join(base, 'dshrc-id-'))
@@ -105,10 +125,8 @@ async function identityRecord(sshHost, signal) {
     'exit 0',
   ].join('; ')
   if (script.includes("'")) throw new Error('identity recorder script must not contain single quotes')
-  // The user's command is passed as separate, quoted words: a word ssh would split is quoted here
-  // so it reaches the shell as one argument after ssh expands its tokens.
-  const quote = word => `"${word.replace(/[\\"]/gu, c => `\\${c}`)}"`
-  const userWords = configured === undefined ? [] : splitCommand(configured).map(quote)
+  // The user's words, each quoted, follow the recorder's own: ssh splits the line back into the
+  // same words and expands their tokens exactly as it would have for the user's command.
   return {
     options: ['-o', `KnownHostsCommand=/bin/sh -c '${script}' dshrc ${file} %I %r %h %p %t %f %K ${userWords.join(' ')}`.trimEnd()],
     /** @returns {Promise<string>} digest of the final destination and its key, or '' when ssh verified none. */
@@ -145,7 +163,7 @@ class SshOutput {
  *   that ran it; rejects with ssh's message on failure.
  */
 export async function sshRun(sshHost, script, { timeoutMs = 90_000, signal } = {}) {
-  const record = await identityRecord(sshHost, signal)
+  const record = await identityRecord(sshHost, { signal })
   try {
     const out = await new Promise((resolve, reject) => {
       // The script travels on stdin, so its size is not bound by the remote argv limit. It is
@@ -281,7 +299,7 @@ export class Tunnel {
     await this.proxy.listen()
     if (this.stopping) throw stoppedError()
     await rm(this.socketPath, { force: true })
-    this.record = await identityRecord(this.sshHost)
+    this.record = await identityRecord(this.sshHost, { ssh: this.ssh })
     if (this.stopping) { await this.record.dispose(); throw stoppedError() }
     const forward = `${this.socketPath}:${this.target.host}:${this.target.port}`
     const child = spawn(this.ssh, [...SSH_OPTIONS, ...this.record.options, '-o', 'ExitOnForwardFailure=yes', '-o', 'StreamLocalBindUnlink=yes',

@@ -92,7 +92,7 @@ import { runKnownHostsCommand } from ${JSON.stringify(join(import.meta.dirname, 
 const args = process.argv.slice(2)
 const dest = args[args.indexOf('--') + 1]
 const host = JSON.parse(readFileSync(${JSON.stringify(join(dir, 'hosts.json'))}, 'utf8'))[dest]
-// \`ssh -G\` (earlier versions resolved aliases with it) answers after \`resolveDelayMs\`.
+// \`ssh -G\`: this fake's own configuration (no KnownHostsCommand), never the user's ~/.ssh/config.
 if (args[0] === '-G') { setTimeout(() => { process.stdout.write('user me\\nhostname ' + (host?.key ?? dest) + '\\nport 22\\n'); process.exit(0) }, host?.resolveDelayMs ?? 0) }
 else {
 if (host === undefined || host.fail) { process.stderr.write((host?.fail ?? 'ssh: Could not resolve hostname') + '\\n'); process.exit(255) }
